@@ -1,0 +1,194 @@
+<div align="center">
+  <img src="docs/logo.png" alt="KomaWeave Logo" width="120" />
+  <h1>KomaWeave</h1>
+  <p><strong>High-speed, GPU-accelerated Manga &amp; Manhwa Translation Server, CLI, and Workbench</strong></p>
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL%20v3-red.svg" alt="License: AGPL v3" /></a>
+    <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+" />
+    <img src="https://img.shields.io/badge/FastAPI-Modular%20API-009688.svg" alt="FastAPI" />
+    <img src="https://img.shields.io/badge/Accelerators-CUDA%20%7C%20MPS%20%7C%20CPU-76b900.svg" alt="CUDA | MPS | CPU" />
+  </p>
+</div>
+
+---
+
+**KomaWeave** weaves together multilingual OCR, smart hybrid inpainting, context-aware translation, and manga-grade typesetting into a single modular server. It is built for single pages, ultra-long vertical webtoon strips, and full multi-page chapters—including speech bubbles split across consecutive image boundaries.
+
+## Key Features
+
+- **General-Purpose Multilingual OCR (`PP-OCRv6`)**: GPU-accelerated batched detection (`CUDAExecutionProvider` when available, automatic CPU fallback) + parallel recognition for vertical Japanese, English, Korean, Chinese, angled text, and clustered sound effects.
+- **Smart Hybrid Text Removal**: Detects uniform speech bubbles for instant solid-color fill and routes complex artwork, gradients, and SFX to [`mayocream/aot-inpainting`](https://huggingface.co/mayocream/aot-inpainting) (FP16 on CUDA, FP32 on Apple MPS / CPU).
+- **Cross-Boundary & Ultra-Long Strip Handling**:
+  - Long vertical strips (`>2600 px`) are sliced at quiet horizontal gutters (`app/image_slicer.py`) without cutting through text.
+  - Consolidated chapter batches stack consecutive same-width images before gutter-aware slicing, keeping speech bubbles spanning page seams intact for OCR, translation, and typesetting before splitting back to exact original heights.
+- **Flexible Translation Backends**:
+  - **Google Translate** built in for zero-config translation.
+  - **Multi-Provider AI** (`OpenAI`, `Google Gemini`, `DeepSeek`, `Anthropic`, `Groq`, `OpenRouter`, and any `Custom OpenAI-Compatible` endpoint such as Ollama/vLLM) with live model discovery, local `.secrets.json` key storage, and token-efficient `{"t":[...]}` JSON batching.
+- **Developer-First Modular Server & Lazy Loading**:
+  - Request full translation (`mode=full`), text extraction only (`POST /api/ocr` or `mode=ocr`), or text removal only (`mode=clean`).
+  - Swap OCR models (`auto` / `medium` / `tiny`), inpainting modes (`auto` / `solid_only` / `aot_only`), external `.ttf`/`.otf` fonts (`font_file` or `/api/fonts`), text colors, outlines, and output formats (`png` / `jpeg` / `webp`) per API call.
+  - Configure `PRELOAD_MODELS=all|ocr|none` so only required assets are loaded into VRAM/RAM.
+- **Manga-Grade Typesetting**: Full Arabic RTL shaping (`arabic-reshaper` + `python-bidi`) with bold manga/dialogue/SFX fonts and automatic black/white contrast + outline selection.
+
+---
+
+## Visual Showcase
+
+### Japanese Manga → English & Arabic
+
+<table>
+  <tr>
+    <th>Original (Japanese)</th>
+    <th>English</th>
+    <th>Arabic (العربية)</th>
+  </tr>
+  <tr>
+    <td><img src="docs/examples/wikipe_1.jpg" alt="Wikipe-tan Page 1 Original" /></td>
+    <td><img src="docs/examples/wikipe_1_en.jpg" alt="Wikipe-tan Page 1 English" /></td>
+    <td><img src="docs/examples/wikipe_1_ar.jpg" alt="Wikipe-tan Page 1 Arabic" /></td>
+  </tr>
+  <tr>
+    <td><img src="docs/examples/wikipe_2.jpg" alt="Wikipe-tan Page 2 Original" /></td>
+    <td><img src="docs/examples/wikipe_2_en.jpg" alt="Wikipe-tan Page 2 English" /></td>
+    <td><img src="docs/examples/wikipe_2_ar.jpg" alt="Wikipe-tan Page 2 Arabic" /></td>
+  </tr>
+  <tr>
+    <td><img src="docs/examples/wikipe_3.jpg" alt="Wikipe-tan Page 3 Original" /></td>
+    <td><img src="docs/examples/wikipe_3_en.jpg" alt="Wikipe-tan Page 3 English" /></td>
+    <td><img src="docs/examples/wikipe_3_ar.jpg" alt="Wikipe-tan Page 3 Arabic" /></td>
+  </tr>
+</table>
+
+<sub>*Original Japanese pages: Wikipe-tan comic by Kasuga, licensed under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) / GFDL. Translated English and Arabic derivatives are shared under the same license.*</sub>
+
+### English Webcomic → Arabic
+
+<table>
+  <tr>
+    <th>Original (English)</th>
+    <th>Arabic (العربية)</th>
+  </tr>
+  <tr>
+    <td><img src="docs/examples/pepper_1.jpg" alt="Pepper&Carrot Page 1 Original" /></td>
+    <td><img src="docs/examples/pepper_1_ar.jpg" alt="Pepper&Carrot Page 1 Arabic" /></td>
+  </tr>
+  <tr>
+    <td><img src="docs/examples/pepper_2.jpg" alt="Pepper&Carrot Page 2 Original" /></td>
+    <td><img src="docs/examples/pepper_2_ar.jpg" alt="Pepper&Carrot Page 2 Arabic" /></td>
+  </tr>
+</table>
+
+<sub>*Original English pages: Pepper&amp;Carrot Episode 1 ("The Potion of Flight") by David Revoy ([peppercarrot.com](https://www.peppercarrot.com)), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Translated into Arabic with KomaWeave.*</sub>
+
+---
+
+## One-Command Setup
+
+Requires **Python 3.10+**.
+
+```bash
+python setup_project.py --venv
+```
+
+This single command automatically:
+1. Creates a local `.venv` virtual environment (omit `--venv` to install into your active Python environment).
+2. Detects your hardware (**NVIDIA CUDA**, **Apple Silicon MPS**, or **CPU**) and installs the matching `torch` and `onnxruntime-gpu` / `onnxruntime` builds plus all dependencies in `requirements.txt`.
+3. Downloads the required manga and Arabic/multilingual fonts into `fonts/`.
+4. Pre-caches the `PP-OCRv6` and `mayocream/aot-inpainting` model weights.
+
+> Override hardware detection with `--device cuda`, `--device mps`, or `--device cpu`.
+
+---
+
+## Quick Start
+
+### 1. Start the Web UI & API Server
+
+```bash
+# Activate .venv first (Windows: .venv\Scripts\activate | Linux/macOS: source .venv/bin/activate)
+python run.py
+```
+
+Open **http://127.0.0.1:8000/** in your browser, or expose on your network:
+
+```bash
+python run.py --host 0.0.0.0 --port 8000
+```
+
+### 2. Translate a Chapter via CLI
+
+```bash
+python translate_chapter.py path/to/chapter_folder --target ar
+```
+
+Key flags: `-o/--output`, `--source`, `--provider`, `--model`, `--api-key`, `--base-url`, `--no-consolidated`.
+
+---
+
+## HTTP API Reference
+
+Interactive OpenAPI docs are available at **`/docs`** when the server is running.
+
+### Core Endpoints
+- `GET /api/health` — Server readiness, active device (`NVIDIA ...`, `Apple MPS`, or `CPU`), `ocr_loaded`, `aot_loaded`, and `ocr_cuda`.
+- `GET /api/fonts` & `POST /api/fonts` — List or upload reusable `.ttf`/`.otf` fonts.
+- `GET /api/providers` & `POST /api/providers/{id}/models` — Manage AI providers and discover live models.
+
+### `POST /api/ocr`
+Extracts text blocks only (skips translation, inpainting, and typesetting) for 1 or more images (`multipart/form-data`).
+- `files`: One or more image files
+- `consolidated` (default `true`): Stacks consecutive same-width images so cross-boundary speech bubbles are extracted intact.
+- `ocr_model`: `auto` | `medium` | `tiny`
+
+### `POST /api/translate` & `POST /api/translate-batch`
+Translates a single page (`file`) or consolidated chapter batch (`files`, `consolidated=true`) with full per-request control:
+- `target_lang` (default `ar`), `source_lang` (default `auto`)
+- `provider` (default `google_free`), optional `model`, `api_key`, `base_url`
+- `mode`: `full` (default) | `ocr` (text extraction only) | `clean` (OCR + text removal only)
+- `ocr_model`: `auto` | `medium` | `tiny`
+- `inpaint_mode`: `auto` | `solid_only` | `aot_only`
+- `font_name` (registered font) or `font_file` (external `.ttf`/`.otf` upload), `font_scale` (`0.4–2.5`), `text_color` (`auto` or `#RRGGBB`), `outline_enabled` (`true`/`false`)
+- `output_format`: `auto` | `png` | `jpeg` | `webp`, `output_quality` (`50–100`)
+
+Example Python client:
+
+```python
+import httpx
+
+files = [
+    ("files", ("001.jpg", open("001.jpg", "rb"), "image/jpeg")),
+    ("files", ("002.jpg", open("002.jpg", "rb"), "image/jpeg")),
+]
+resp = httpx.post(
+    "http://127.0.0.1:8000/api/translate-batch",
+    files=files,
+    data={"target_lang": "ar", "consolidated": "true", "inpaint_mode": "auto"},
+    timeout=120,
+)
+data = resp.json()
+print("Total time (s):", data["chapter_timings_s"]["total"])
+```
+
+---
+
+## Hardware Support
+
+| Hardware | OCR Detection | AOT-GAN Inpainting | Notes |
+| --- | --- | --- | --- |
+| **NVIDIA GPU (CUDA)** | `CUDAExecutionProvider` | CUDA (FP16) | Fastest mode; auto-selected when `nvidia-smi` is detected |
+| **Apple Silicon (M1–M4)** | CPU | MPS (FP32) | Auto-selected on macOS `arm64` |
+| **CPU (x86_64 / ARM64)** | CPU | CPU (FP32) | Works out of the box without a GPU |
+
+---
+
+## Configuration & Security
+
+- Copy `.env.example` to `.env` to configure `HOST`, `PORT`, `ALLOWED_ORIGINS`, `PRELOAD_MODELS` (`all` | `ocr` | `none`), `MAX_UPLOAD_MB` (`50`), and `MAX_BATCH_FILES` (`300`).
+- Saved AI provider API keys are stored locally in `.secrets.json` (git-ignored, `0600` permissions on POSIX) and are never returned unmasked by `/api/providers`.
+
+---
+
+## License & Attributions
+
+- **KomaWeave** is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** ([LICENSE](LICENSE))—anyone modifying or running a modified version as a network service must release their source code under AGPL-3.0.
+- Third-party model, font, UI, and showcase image licenses and attributions are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

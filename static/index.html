@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KomaWeave — Manga &amp; Manhwa Typesetting Studio</title>
+  <link rel="stylesheet" href="/static/vendor/pico.min.css" />
+  <style>
+    :root {
+      --pico-font-size: 14.5px;
+      --pico-border-radius: 6px;
+    }
+    body {
+      margin: 0;
+      background: #f6f7f9;
+      min-height: 100vh;
+    }
+    .workbench {
+      display: grid;
+      grid-template-columns: 350px 1fr;
+      gap: 1.25rem;
+      max-width: 1520px;
+      margin: 0 auto;
+      padding: 1.25rem;
+      align-items: start;
+    }
+    @media (max-width: 960px) {
+      .workbench { grid-template-columns: 1fr; }
+    }
+    article.card {
+      margin: 0;
+      padding: 1.15rem;
+      background: #ffffff;
+      border: 1px solid #e2e6ec;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.04);
+    }
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.8rem;
+      color: #5c6676;
+      padding-bottom: 0.75rem;
+      margin-bottom: 0.85rem;
+      border-bottom: 1px solid #edf0f5;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #d97706;
+      margin-right: 6px;
+    }
+    .dot.ready { background: #16a34a; }
+    .dropzone {
+      border: 1.5px dashed #cbd5e1;
+      border-radius: 6px;
+      padding: 1.1rem 0.9rem;
+      text-align: center;
+      cursor: pointer;
+      background: #fafbfc;
+      margin-bottom: 0.9rem;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .dropzone:hover, .dropzone.dragover {
+      border-color: #0f172a;
+      background: #f1f5f9;
+    }
+    .dropzone small { color: #64748b; display: block; margin-top: 0.2rem; }
+    .file-summary { font-size: 0.82rem; font-weight: 600; color: #0f172a; margin-top: 0.4rem; word-break: break-all; }
+    .sub-panel {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 0.8rem;
+      margin-bottom: 0.9rem;
+    }
+    .inline-group {
+      display: flex;
+      gap: 0.4rem;
+      align-items: stretch;
+    }
+    .inline-group > input, .inline-group > select { flex: 1; margin-bottom: 0; }
+    .inline-group > button { width: auto; margin-bottom: 0; padding: 0.45rem 0.75rem; font-size: 0.82rem; }
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+    .metric-cell {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 0.55rem 0.65rem;
+    }
+    .metric-cell .k { font-size: 0.7rem; text-transform: uppercase; color: #64748b; }
+    .metric-cell .v { font-size: 0.95rem; font-weight: 700; color: #0f172a; }
+    .viewer-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 0.85rem;
+    }
+    .canvas-stage {
+      min-height: 540px;
+      background: #181a1f;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      padding: 0.5rem;
+    }
+    .canvas-stage img {
+      max-width: 100%;
+      max-height: 78vh;
+      object-fit: contain;
+      display: block;
+    }
+    .split-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.5rem;
+      width: 100%;
+    }
+    .split-grid img { width: 100%; max-height: 75vh; object-fit: contain; }
+    .placeholder { color: #94a3b8; font-size: 0.92rem; }
+    .regions-list {
+      max-height: 280px;
+      overflow-y: auto;
+      margin-top: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+    }
+    .region-row {
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 0.55rem 0.75rem;
+      background: #fafbfc;
+      font-size: 0.84rem;
+    }
+    .region-row .src { color: #64748b; }
+    .region-row .dst { color: #0f172a; font-weight: 600; margin-top: 0.2rem; }
+    label { font-size: 0.82rem; font-weight: 600; margin-bottom: 0.25rem; }
+    select, input[type="text"], input[type="password"] { margin-bottom: 0.7rem; }
+  </style>
+</head>
+<body>
+  <main class="workbench">
+    <article class="card">
+      <div class="status-bar">
+        <span><span id="statusDot" class="dot"></span><span id="statusText">Connecting...</span></span>
+        <span id="deviceBadge"></span>
+      </div>
+
+      <div id="dropzone" class="dropzone">
+        <strong>Drop image(s) or click to browse</strong>
+        <small>Single page, ultra-long strip, or chapter batch</small>
+        <div id="fileName" class="file-summary"></div>
+        <input type="file" id="fileInput" accept="image/*" multiple hidden />
+      </div>
+
+      <label for="providerSelect">Translation Provider</label>
+      <select id="providerSelect"></select>
+
+      <div id="aiConfigBox" class="sub-panel" hidden>
+        <div id="customUrlWrap" hidden>
+          <label for="baseUrlInput">API Base URL</label>
+          <input type="text" id="baseUrlInput" placeholder="https://api.example.com/v1" />
+        </div>
+
+        <label for="apiKeyInput">API Key <small id="keyStatus" style="font-weight:400;color:#64748b;"></small></label>
+        <div class="inline-group" style="margin-bottom:0.7rem;">
+          <input type="password" id="apiKeyInput" placeholder="Enter API key..." />
+          <button type="button" id="saveKeyBtn" class="secondary">Save</button>
+          <button type="button" id="clearKeyBtn" class="outline secondary" hidden>Clear</button>
+        </div>
+
+        <label for="modelSelect">Model</label>
+        <div class="inline-group" style="margin-bottom:0.5rem;">
+          <select id="modelSelect"></select>
+          <button type="button" id="refreshModelsBtn" class="secondary">Fetch</button>
+        </div>
+        <input type="text" id="manualModelInput" placeholder="Or enter model ID manually..." style="margin-bottom:0;" />
+      </div>
+
+      <div class="grid" style="gap:0.6rem;">
+        <div>
+          <label for="sourceLang">Source</label>
+          <select id="sourceLang">
+            <option value="auto" selected>Auto-Detect</option>
+            <option value="ja">Japanese</option>
+            <option value="ko">Korean</option>
+            <option value="zh-CN">Chinese</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+        <div>
+          <label for="targetLang">Target</label>
+          <select id="targetLang"></select>
+        </div>
+      </div>
+
+      <label id="consolidatedWrap" hidden style="display:flex;align-items:center;gap:0.45rem;margin-bottom:0.8rem;font-weight:500;">
+        <input type="checkbox" id="consolidatedChk" checked style="margin:0;" />
+        Treat batch as single chapter/set (shared context)
+      </label>
+
+      <button id="translateBtn" disabled style="width:100%;margin-bottom:0.5rem;">Translate</button>
+      <button id="downloadBtn" class="secondary outline" hidden style="width:100%;">Download Output</button>
+
+      <div id="metricsSection" hidden>
+        <div class="metrics-grid">
+          <div class="metric-cell"><div class="k">Total</div><div id="mTotal" class="v">-</div></div>
+          <div class="metric-cell"><div class="k">OCR</div><div id="mOcr" class="v">-</div></div>
+          <div class="metric-cell"><div class="k">Translate</div><div id="mTrans" class="v">-</div></div>
+          <div class="metric-cell"><div class="k">Inpaint</div><div id="mInpaint" class="v">-</div></div>
+          <div class="metric-cell"><div class="k">Render</div><div id="mRender" class="v">-</div></div>
+          <div class="metric-cell"><div class="k">Details</div><div id="mRemoval" class="v">-</div></div>
+        </div>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="viewer-toolbar">
+        <div role="group" style="margin:0;">
+          <button id="tabResult" class="btn-tab" style="padding:0.4rem 0.8rem;">Translated</button>
+          <button id="tabOriginal" class="secondary outline btn-tab" style="padding:0.4rem 0.8rem;">Original</button>
+          <button id="tabSplit" class="secondary outline btn-tab" style="padding:0.4rem 0.8rem;">Split</button>
+        </div>
+        <div id="batchNav" hidden style="display:flex;align-items:center;gap:0.5rem;">
+          <button id="prevPageBtn" class="secondary outline" style="padding:0.35rem 0.7rem;margin:0;">Prev</button>
+          <span id="batchPageLabel" style="font-size:0.84rem;color:#475569;">1 / 1</span>
+          <button id="nextPageBtn" class="secondary outline" style="padding:0.35rem 0.7rem;margin:0;">Next</button>
+        </div>
+      </div>
+
+      <div id="canvasWrap" class="canvas-stage">
+        <span class="placeholder">Upload a page, long strip, or chapter batch to begin.</span>
+      </div>
+
+      <div id="blocksSection" hidden style="margin-top:1rem;">
+        <strong style="font-size:0.9rem;">Translated Regions (<span id="blockCount">0</span>)</strong>
+        <div id="blocksList" class="regions-list"></div>
+      </div>
+    </article>
+  </main>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const dropzone = document.getElementById('dropzone');
+    const fileNameEl = document.getElementById('fileName');
+    const targetLangEl = document.getElementById('targetLang');
+    const sourceLangEl = document.getElementById('sourceLang');
+    const providerSelect = document.getElementById('providerSelect');
+    const aiConfigBox = document.getElementById('aiConfigBox');
+    const customUrlWrap = document.getElementById('customUrlWrap');
+    const baseUrlInput = document.getElementById('baseUrlInput');
+    const apiKeyInput = document.getElementById('apiKeyInput');
+    const keyStatus = document.getElementById('keyStatus');
+    const saveKeyBtn = document.getElementById('saveKeyBtn');
+    const clearKeyBtn = document.getElementById('clearKeyBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const refreshModelsBtn = document.getElementById('refreshModelsBtn');
+    const manualModelInput = document.getElementById('manualModelInput');
+    const consolidatedWrap = document.getElementById('consolidatedWrap');
+    const consolidatedChk = document.getElementById('consolidatedChk');
+    const translateBtn = document.getElementById('translateBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const canvasWrap = document.getElementById('canvasWrap');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const deviceBadge = document.getElementById('deviceBadge');
+    const batchNav = document.getElementById('batchNav');
+    const batchPageLabel = document.getElementById('batchPageLabel');
+
+    let selectedFiles = [];
+    let originalUrls = [];
+    let batchResults = [];
+    let currentIdx = 0;
+    let viewMode = 'result';
+    let providersMap = {};
+
+    async function init() {
+      try {
+        const [hRes, lRes, pRes] = await Promise.all([
+          fetch('/api/health'),
+          fetch('/api/languages'),
+          fetch('/api/providers'),
+        ]);
+        const h = await hRes.json();
+        statusDot.classList.toggle('ready', h.status === 'ready');
+        statusText.textContent = h.status === 'ready' ? 'Ready' : 'Initializing';
+        deviceBadge.textContent = h.device;
+
+        const l = await lRes.json();
+        Object.entries(l.languages).forEach(([code, name]) => {
+          const opt = document.createElement('option');
+          opt.value = code;
+          opt.textContent = name;
+          if (code === 'ar') opt.selected = true;
+          targetLangEl.appendChild(opt);
+        });
+
+        const p = await pRes.json();
+        p.providers.forEach((prov) => {
+          providersMap[prov.id] = prov;
+          const opt = document.createElement('option');
+          opt.value = prov.id;
+          opt.textContent = prov.name;
+          providerSelect.appendChild(opt);
+        });
+        onProviderChange();
+      } catch (e) {
+        statusText.textContent = 'Offline';
+      }
+    }
+
+    function populateModelSelect(models, selected) {
+      modelSelect.innerHTML = '';
+      const list = models && models.length ? models : (selected ? [selected] : []);
+      if (!list.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '-- Click Fetch or type manually --';
+        modelSelect.appendChild(opt);
+        return;
+      }
+      list.forEach((m) => {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        if (m === selected) opt.selected = true;
+        modelSelect.appendChild(opt);
+      });
+    }
+
+    async function fetchModels(auto = false) {
+      const pid = providerSelect.value;
+      const prov = providersMap[pid];
+      if (!prov || !prov.requires_key) return;
+      refreshModelsBtn.disabled = true;
+      refreshModelsBtn.textContent = '...';
+      try {
+        const res = await fetch(`/api/providers/${pid}/models`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: apiKeyInput.value.trim() || null,
+            base_url: baseUrlInput.value.trim() || null,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Failed to fetch models');
+        populateModelSelect(data.models, manualModelInput.value.trim() || prov.selected_model || '');
+      } catch (err) {
+        if (!auto) alert(err.message);
+      } finally {
+        refreshModelsBtn.disabled = false;
+        refreshModelsBtn.textContent = 'Fetch';
+      }
+    }
+
+    function onProviderChange() {
+      const prov = providersMap[providerSelect.value];
+      if (!prov || !prov.requires_key) {
+        aiConfigBox.hidden = true;
+        return;
+      }
+      aiConfigBox.hidden = false;
+      customUrlWrap.hidden = !prov.supports_custom_url;
+      baseUrlInput.value = prov.base_url || '';
+      apiKeyInput.value = '';
+      keyStatus.textContent = prov.has_key ? `(Saved: ${prov.masked_key})` : '(Not saved)';
+      clearKeyBtn.hidden = !prov.has_key;
+      manualModelInput.value = '';
+      populateModelSelect(prov.selected_model ? [prov.selected_model] : [], prov.selected_model || '');
+      if (prov.has_key) fetchModels(true);
+    }
+
+    providerSelect.addEventListener('change', onProviderChange);
+    refreshModelsBtn.addEventListener('click', () => fetchModels(false));
+
+    saveKeyBtn.addEventListener('click', async () => {
+      const pid = providerSelect.value;
+      const res = await fetch(`/api/providers/${pid}/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: apiKeyInput.value.trim() || null,
+          base_url: baseUrlInput.value.trim() || null,
+          selected_model: manualModelInput.value.trim() || modelSelect.value || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.detail || 'Failed to save');
+      providersMap[pid] = data.provider;
+      apiKeyInput.value = '';
+      keyStatus.textContent = data.provider.has_key ? `(Saved: ${data.provider.masked_key})` : '(Not saved)';
+      clearKeyBtn.hidden = !data.provider.has_key;
+      fetchModels(true);
+    });
+
+    clearKeyBtn.addEventListener('click', async () => {
+      const pid = providerSelect.value;
+      const res = await fetch(`/api/providers/${pid}/key`, { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok) {
+        providersMap[pid] = data.provider;
+        keyStatus.textContent = '(Not saved)';
+        clearKeyBtn.hidden = true;
+      }
+    });
+
+    function setFiles(fileList) {
+      const files = Array.from(fileList || []).filter((f) => f.type.startsWith('image/'));
+      if (!files.length) return;
+      selectedFiles = files;
+      originalUrls.forEach((u) => URL.revokeObjectURL(u));
+      originalUrls = files.map((f) => URL.createObjectURL(f));
+      batchResults = [];
+      currentIdx = 0;
+      batchNav.hidden = true;
+      downloadBtn.hidden = true;
+      translateBtn.disabled = false;
+      consolidatedWrap.hidden = files.length <= 1;
+      if (files.length === 1) {
+        fileNameEl.textContent = `${files[0].name} (${(files[0].size / 1024).toFixed(1)} KB)`;
+        translateBtn.textContent = 'Translate';
+      } else {
+        const totalKb = files.reduce((s, f) => s + f.size, 0) / 1024;
+        fileNameEl.textContent = `${files.length} pages (${totalKb.toFixed(0)} KB)`;
+        translateBtn.textContent = `Translate Batch (${files.length})`;
+      }
+      renderView();
+    }
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => setFiles(e.target.files));
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      setFiles(e.dataTransfer.files);
+    });
+
+    function renderView() {
+      const orig = originalUrls[currentIdx];
+      const tr = batchResults[currentIdx]?.image_base64;
+      if (!orig && !tr) return;
+      if (viewMode === 'split' && orig && tr) {
+        canvasWrap.innerHTML = `<div class="split-grid"><img src="${orig}" alt="Original" /><img src="${tr}" alt="Translated" /></div>`;
+      } else if (viewMode === 'original' || !tr) {
+        canvasWrap.innerHTML = `<img src="${orig}" alt="Original" />`;
+      } else {
+        canvasWrap.innerHTML = `<img src="${tr}" alt="Translated" />`;
+      }
+      if (batchResults.length > 1) {
+        batchNav.hidden = false;
+        batchPageLabel.textContent = `${currentIdx + 1} / ${batchResults.length}`;
+      } else {
+        batchNav.hidden = true;
+      }
+      if (batchResults[currentIdx]) {
+        const cur = batchResults[currentIdx];
+        document.getElementById('blocksSection').hidden = false;
+        document.getElementById('blockCount').textContent = cur.block_count;
+        document.getElementById('blocksList').innerHTML = cur.blocks.map((b) => `
+          <div class="region-row">
+            <div class="src">${b.source_text}</div>
+            <div class="dst" dir="auto">${b.translated_text}</div>
+          </div>
+        `).join('');
+      }
+    }
+
+    document.getElementById('prevPageBtn').onclick = () => {
+      if (currentIdx > 0) { currentIdx--; renderView(); }
+    };
+    document.getElementById('nextPageBtn').onclick = () => {
+      if (currentIdx < batchResults.length - 1) { currentIdx++; renderView(); }
+    };
+
+    function switchTab(mode, btn) {
+      viewMode = mode;
+      document.querySelectorAll('.btn-tab').forEach((b) => b.classList.add('secondary', 'outline'));
+      btn.classList.remove('secondary', 'outline');
+      renderView();
+    }
+    document.getElementById('tabResult').onclick = (e) => switchTab('result', e.target);
+    document.getElementById('tabOriginal').onclick = (e) => switchTab('original', e.target);
+    document.getElementById('tabSplit').onclick = (e) => switchTab('split', e.target);
+
+    translateBtn.addEventListener('click', async () => {
+      if (!selectedFiles.length) return;
+      translateBtn.disabled = true;
+      translateBtn.setAttribute('aria-busy', 'true');
+      translateBtn.textContent = 'Processing...';
+
+      const pid = providerSelect.value;
+      const chosenModel = manualModelInput.value.trim() || modelSelect.value || '';
+      const fd = new FormData();
+      fd.append('target_lang', targetLangEl.value);
+      fd.append('source_lang', sourceLangEl.value);
+      fd.append('provider', pid);
+      if (chosenModel) fd.append('model', chosenModel);
+      if (apiKeyInput.value.trim()) fd.append('api_key', apiKeyInput.value.trim());
+      if (baseUrlInput.value.trim()) fd.append('base_url', baseUrlInput.value.trim());
+
+      try {
+        if (selectedFiles.length === 1) {
+          fd.append('file', selectedFiles[0]);
+          const res = await fetch('/api/translate', { method: 'POST', body: fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Translation failed');
+          batchResults = [data];
+          currentIdx = 0;
+
+          document.getElementById('metricsSection').hidden = false;
+          document.getElementById('mTotal').textContent = `${data.timings_s.total.toFixed(2)}s`;
+          document.getElementById('mOcr').textContent = `${data.timings_s.ocr.toFixed(2)}s`;
+          document.getElementById('mTrans').textContent = `${data.timings_s.translate.toFixed(2)}s`;
+          document.getElementById('mInpaint').textContent = `${data.timings_s.inpaint.toFixed(2)}s`;
+          document.getElementById('mRender').textContent = `${data.timings_s.render.toFixed(2)}s`;
+          document.getElementById('mRemoval').textContent = `${data.inpaint_stats.solid_filled} / ${data.inpaint_stats.aot_inpainted}`;
+        } else {
+          selectedFiles.forEach((f) => fd.append('files', f));
+          fd.append('consolidated', consolidatedChk.checked ? 'true' : 'false');
+          const res = await fetch('/api/translate-batch', { method: 'POST', body: fd });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'Batch translation failed');
+          batchResults = data.results;
+          currentIdx = 0;
+
+          const cs = data.chapter_timings_s;
+          document.getElementById('metricsSection').hidden = false;
+          document.getElementById('mTotal').textContent = `${cs.total.toFixed(2)}s`;
+          document.getElementById('mOcr').textContent = `${cs.ocr.toFixed(2)}s`;
+          document.getElementById('mTrans').textContent = `${cs.translate.toFixed(2)}s`;
+          document.getElementById('mInpaint').textContent = `${cs.inpaint.toFixed(2)}s`;
+          document.getElementById('mRender').textContent = `${cs.render.toFixed(2)}s`;
+          document.getElementById('mRemoval').textContent = `${data.image_count} pages`;
+        }
+
+        switchTab('result', document.getElementById('tabResult'));
+        downloadBtn.hidden = false;
+        downloadBtn.onclick = () => {
+          const a = document.createElement('a');
+          a.href = batchResults[currentIdx].image_base64;
+          a.download = `translated_${targetLangEl.value}_${selectedFiles[currentIdx].name.replace(/\.[^.]+$/, '')}.png`;
+          a.click();
+        };
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        translateBtn.disabled = false;
+        translateBtn.removeAttribute('aria-busy');
+        translateBtn.textContent = selectedFiles.length > 1 ? `Translate Batch (${selectedFiles.length})` : 'Translate';
+      }
+    });
+
+    init();
+  </script>
+</body>
+</html>

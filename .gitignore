@@ -1,0 +1,19 @@
+# Secrets & local configuration
+.secrets.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Outputs & logs
+test_outputs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
