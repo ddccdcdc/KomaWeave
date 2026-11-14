@@ -34,51 +34,27 @@
 
 ## Visual Showcase
 
-### Japanese Manga → English & Arabic
-
-<table>
-  <tr>
-    <th>Original (Japanese)</th>
-    <th>English</th>
-    <th>Arabic (العربية)</th>
-  </tr>
-  <tr>
-    <td><img src="docs/examples/wikipe_1.jpg" alt="Wikipe-tan Page 1 Original" /></td>
-    <td><img src="docs/examples/wikipe_1_en.jpg" alt="Wikipe-tan Page 1 English" /></td>
-    <td><img src="docs/examples/wikipe_1_ar.jpg" alt="Wikipe-tan Page 1 Arabic" /></td>
-  </tr>
-  <tr>
-    <td><img src="docs/examples/wikipe_2.jpg" alt="Wikipe-tan Page 2 Original" /></td>
-    <td><img src="docs/examples/wikipe_2_en.jpg" alt="Wikipe-tan Page 2 English" /></td>
-    <td><img src="docs/examples/wikipe_2_ar.jpg" alt="Wikipe-tan Page 2 Arabic" /></td>
-  </tr>
-  <tr>
-    <td><img src="docs/examples/wikipe_3.jpg" alt="Wikipe-tan Page 3 Original" /></td>
-    <td><img src="docs/examples/wikipe_3_en.jpg" alt="Wikipe-tan Page 3 English" /></td>
-    <td><img src="docs/examples/wikipe_3_ar.jpg" alt="Wikipe-tan Page 3 Arabic" /></td>
-  </tr>
-</table>
-
-<sub>*Original Japanese pages: Wikipe-tan comic by Kasuga, licensed under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) / GFDL. Translated English and Arabic derivatives are shared under the same license.*</sub>
-
-### English Webcomic → Arabic
+### English Webcomic → Arabic & Chinese Simplified
 
 <table>
   <tr>
     <th>Original (English)</th>
     <th>Arabic (العربية)</th>
+    <th>Chinese (简体中文)</th>
   </tr>
   <tr>
     <td><img src="docs/examples/pepper_1.jpg" alt="Pepper&Carrot Page 1 Original" /></td>
     <td><img src="docs/examples/pepper_1_ar.jpg" alt="Pepper&Carrot Page 1 Arabic" /></td>
+    <td><img src="docs/examples/pepper_1_zh.jpg" alt="Pepper&Carrot Page 1 Chinese" /></td>
   </tr>
   <tr>
     <td><img src="docs/examples/pepper_2.jpg" alt="Pepper&Carrot Page 2 Original" /></td>
     <td><img src="docs/examples/pepper_2_ar.jpg" alt="Pepper&Carrot Page 2 Arabic" /></td>
+    <td><img src="docs/examples/pepper_2_zh.jpg" alt="Pepper&Carrot Page 2 Chinese" /></td>
   </tr>
 </table>
 
-<sub>*Original English pages: Pepper&amp;Carrot Episode 1 ("The Potion of Flight") by David Revoy ([peppercarrot.com](https://www.peppercarrot.com)), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Translated into Arabic with KomaWeave.*</sub>
+<sub>*Original English pages: Pepper&amp;Carrot Episode 1 ("The Potion of Flight") by David Revoy ([peppercarrot.com](https://www.peppercarrot.com)), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Translated into Arabic and Chinese Simplified with KomaWeave.*</sub>
 
 ---
 

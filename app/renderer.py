@@ -67,6 +67,24 @@ class MangaRenderer:
                 return FONT_ARABIC_SFX
             if FONT_ARABIC.exists():
                 return FONT_ARABIC
+        if target_lang in {"zh-CN", "zh-TW", "ja", "ko"}:
+            cjk_candidates = (
+                [Path("C:/Windows/Fonts/msyhbd.ttc"), Path("C:/Windows/Fonts/msyh.ttc")]
+                if target_lang in {"zh-CN", "zh-TW"}
+                else (
+                    [Path("C:/Windows/Fonts/YuGothB.ttc"), Path("C:/Windows/Fonts/msyhbd.ttc")]
+                    if target_lang == "ja"
+                    else [Path("C:/Windows/Fonts/malgunbd.ttf"), Path("C:/Windows/Fonts/msyhbd.ttc")]
+                )
+            )
+            cjk_candidates.extend([
+                Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+                Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
+                Path("/System/Library/Fonts/PingFang.ttc"),
+            ])
+            for cand in cjk_candidates:
+                if cand.exists():
+                    return cand
         if target_lang in {"ja", "ko", "zh-CN", "zh-TW", "th", "hi", "ru", "uk"}:
             if FONT_FALLBACK.exists():
                 return FONT_FALLBACK
@@ -136,6 +154,21 @@ class MangaRenderer:
         max_width: int,
         is_rtl: bool,
     ) -> List[str]:
+        has_cjk = any("\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" for ch in text)
+        if has_cjk and len(text.split()) <= 2:
+            lines: List[str] = []
+            current = ""
+            for ch in text:
+                candidate = current + ch
+                if MangaRenderer._text_width(draw, candidate, font, is_rtl) <= max_width or not current:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = ch
+            if current:
+                lines.append(current)
+            return lines
+
         words = text.split()
         if not words:
             return [text]

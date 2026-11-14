@@ -19,15 +19,10 @@ KomaWeave source code is licensed under the **GNU Affero General Public License 
 
 ## Documentation Showcase Images (`docs/examples/`)
 
-- **Wikipe-tan Comic Pages (`wikipe_1`–`wikipe_3` and translated derivatives)**
-  - **Author:** Kasuga (Japanese Wikipedia)
-  - **License:** Creative Commons Attribution-ShareAlike 3.0 Unported (CC BY-SA 3.0) / GNU Free Documentation License (GFDL)
-  - **Notes:** Translated English and Arabic derivative images are likewise shared under CC BY-SA 3.0 / GFDL.
-
-- **Pepper&Carrot Episode 1: "The Potion of Flight" (`pepper_1`–`pepper_2` and Arabic translations)**
+- **Pepper&Carrot Episode 1: "The Potion of Flight" (`pepper_1`–`pepper_2`, Arabic & Chinese Simplified translations)**
   - **Author:** David Revoy (`https://www.peppercarrot.com`)
   - **License:** Creative Commons Attribution 4.0 International (CC BY 4.0)
-  - **Notes:** Translated Arabic derivative images are adapted from the original Episode 1 pages with attribution to David Revoy.
+  - **Notes:** Translated Arabic and Chinese Simplified derivative images are adapted from the original Episode 1 pages with attribution to David Revoy.
 
 ## Core Python Dependencies
 
