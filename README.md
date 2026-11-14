@@ -155,6 +155,16 @@ print("Total time (s):", data["chapter_timings_s"]["total"])
 | **Apple Silicon (M1–M4)** | CPU | MPS (FP32) | Auto-selected on macOS `arm64` |
 | **CPU (x86_64 / ARM64)** | CPU | CPU (FP32) | Works out of the box without a GPU |
 
+## GPU Performance Benchmarks
+
+Measured on **NVIDIA GeForce RTX 2080 SUPER** (warmed pipeline, CUDA FP16 inpainting, `CUDAExecutionProvider` OCR, Google Translate):
+
+| Workload | Settings / Features Enabled | Total Time | Average / Page | Breakdown |
+| --- | --- | --- | --- | --- |
+| **167-Page Chapter Batch** (`800×1280`, 179 text blocks) | `consolidated=True`, cross-boundary gutter slicing, batched GPU `PP-OCRv6_det_tiny` (`800×800`) + parallel CPU `Rec`, smart solid-fill + `aot-inpainting` FP16 (in parallel with translation), 8-thread Pillow render | **22.83 s** | **0.137 s / page** | OCR: `8.90 s` (`0.053 s/img`) · Translate: `3.06 s` (parallel) · Inpaint: `9.60 s` · Render: `3.46 s` · Disk write: `0.13 s` |
+| **Single Webcomic Page** (`740×1024`, 3 blocks) | `ocr_model="auto"` (`PP-OCRv6_det_medium` `1280×1280`), `inpaint_mode="auto"`, Google Translate | **0.392 s** | **0.392 s** | OCR: `0.191 s` · Inpaint: `0.181 s` · Translate: `0.156 s` (parallel) · Render: `0.020 s` |
+| **Single Manhwa Page** (`800×1280`, 1 block, cold AOT shape) | `ocr_model="auto"` (`PP-OCRv6_det_medium` `1280×1280`), `inpaint_mode="auto"`, Google Translate | **3.674 s** | **3.674 s** | OCR: `0.230 s` · Inpaint: `3.412 s` · Translate: `2.589 s` (parallel) · Render: `0.031 s` |
+
 ---
 
 ## Configuration & Security
