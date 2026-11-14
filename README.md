@@ -63,6 +63,8 @@
 Requires **Python 3.10+**.
 
 ```bash
+git clone https://github.com/ddccdcdc/KomaWeave.git
+cd KomaWeave
 python setup_project.py --venv
 ```
 
