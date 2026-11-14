@@ -34,27 +34,33 @@
 
 ## Visual Showcase
 
-### English Webcomic → Arabic & Chinese Simplified
+### Multilingual Showcase (5 Languages)
 
 <table>
   <tr>
-    <th>Original (English)</th>
+    <th>English (Original)</th>
     <th>Arabic (العربية)</th>
     <th>Chinese (简体中文)</th>
+    <th>Spanish (Español)</th>
+    <th>French (Français)</th>
   </tr>
   <tr>
-    <td><img src="docs/examples/pepper_1.jpg" alt="Pepper&Carrot Page 1 Original" /></td>
+    <td><img src="docs/examples/pepper_1.jpg" alt="Pepper&Carrot Page 1 English" /></td>
     <td><img src="docs/examples/pepper_1_ar.jpg" alt="Pepper&Carrot Page 1 Arabic" /></td>
     <td><img src="docs/examples/pepper_1_zh.jpg" alt="Pepper&Carrot Page 1 Chinese" /></td>
+    <td><img src="docs/examples/pepper_1_es.jpg" alt="Pepper&Carrot Page 1 Spanish" /></td>
+    <td><img src="docs/examples/pepper_1_fr.jpg" alt="Pepper&Carrot Page 1 French" /></td>
   </tr>
   <tr>
-    <td><img src="docs/examples/pepper_2.jpg" alt="Pepper&Carrot Page 2 Original" /></td>
+    <td><img src="docs/examples/pepper_2.jpg" alt="Pepper&Carrot Page 2 English" /></td>
     <td><img src="docs/examples/pepper_2_ar.jpg" alt="Pepper&Carrot Page 2 Arabic" /></td>
     <td><img src="docs/examples/pepper_2_zh.jpg" alt="Pepper&Carrot Page 2 Chinese" /></td>
+    <td><img src="docs/examples/pepper_2_es.jpg" alt="Pepper&Carrot Page 2 Spanish" /></td>
+    <td><img src="docs/examples/pepper_2_fr.jpg" alt="Pepper&Carrot Page 2 French" /></td>
   </tr>
 </table>
 
-<sub>*Original English pages: Pepper&amp;Carrot Episode 1 ("The Potion of Flight") by David Revoy ([peppercarrot.com](https://www.peppercarrot.com)), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Translated into Arabic and Chinese Simplified with KomaWeave.*</sub>
+<sub>*Original English pages: Pepper&amp;Carrot Episode 1 ("The Potion of Flight") by David Revoy ([peppercarrot.com](https://www.peppercarrot.com)), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Translated into Arabic, Chinese Simplified, Spanish, and French with KomaWeave.*</sub>
 
 ---
 
@@ -171,12 +177,23 @@ Measured on **NVIDIA GeForce RTX 2080 SUPER** (warmed pipeline, CUDA FP16 inpain
 
 ## Configuration & Security
 
-- Copy `.env.example` to `.env` to configure `HOST`, `PORT`, `ALLOWED_ORIGINS`, `PRELOAD_MODELS` (`all` | `ocr` | `none`), `MAX_UPLOAD_MB` (`50`), and `MAX_BATCH_FILES` (`300`).
-- Saved AI provider API keys are stored locally in `.secrets.json` (git-ignored, `0600` permissions on POSIX) and are never returned unmasked by `/api/providers`.
+- **API Authentication:** Set `KOMAWEAVE_API_KEY` to require `X-API-Key` or `Authorization: Bearer <token>` on all `/api/*` endpoints (except `/api/health`). When binding to a non-loopback host (`--host 0.0.0.0`) without `KOMAWEAVE_API_KEY`, `run.py` automatically generates and prints a 32-byte session API key (override with `--allow-unauthenticated` only on trusted isolated networks).
+- **SSRF Protection:** Custom provider `base_url` endpoints reject loopback, private, link-local, and cloud metadata IPs (`169.254.169.254`) and disable HTTP redirects. To allow a local Ollama/vLLM server (`localhost` / `127.0.0.1`), set `KOMAWEAVE_ALLOW_LOCAL_PROVIDERS=1`.
+- **Upload, Pixel & Concurrency Limits:** Streaming chunked reads cap single files (`MAX_UPLOAD_MB=25`), aggregate batch payload (`MAX_BATCH_TOTAL_MB=250`), image dimensions/pixels (`MAX_IMAGE_WIDTH=8192`, `MAX_IMAGE_HEIGHT=16384`, `MAX_IMAGE_PIXELS=40000000`), per-IP rate limits, request timeout (`REQUEST_TIMEOUT_SECONDS=300`), and concurrent GPU jobs (`MAX_CONCURRENT_GPU_JOBS=2`).
+- **Secrets Storage:** Saved AI provider API keys are stored locally in `.secrets.json` (git-ignored, `0600` permissions on POSIX) and are never returned unmasked by `/api/providers`.
+
+---
+
+## Privacy & Data Handling
+
+- OCR, inpainting, and typesetting run **100% locally**; images are processed in memory and are **not** stored on disk by the HTTP API or sent to translation providers.
+- When translating with `google_free` (default) or a cloud AI provider, **extracted text** is sent to that third-party service (`google_free` uses Google Translate's public web endpoint, not the Google Cloud Translation API).
+- For confidential or unpublished manuscripts, use a local LLM (`KOMAWEAVE_ALLOW_LOCAL_PROVIDERS=1`) or OCR-only mode (`POST /api/ocr`). See [PRIVACY.md](PRIVACY.md) for full details.
 
 ---
 
 ## License & Attributions
 
 - **KomaWeave** is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** ([LICENSE](LICENSE))—anyone modifying or running a modified version as a network service must release their source code under AGPL-3.0.
-- Third-party model, font, UI, and showcase image licenses and attributions are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+- Model weight provenance and licenses are documented in [MODEL_LICENSES.md](MODEL_LICENSES.md).
+- Third-party libraries, fonts, and UI asset licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

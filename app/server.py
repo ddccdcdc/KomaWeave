@@ -4,24 +4,43 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import io
 import os
+import threading
+import time
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import ImageFont
+from PIL import Image, ImageFont
 from pydantic import BaseModel
 
-from app.config import FONTS_DIR, LANGUAGES, STATIC_DIR
+from app.config import (
+    FONTS_DIR,
+    LANGUAGES,
+    MAX_BATCH_FILES,
+    MAX_BATCH_TOTAL_BYTES,
+    MAX_CONCURRENT_GPU_JOBS,
+    MAX_IMAGE_HEIGHT,
+    MAX_IMAGE_PIXELS,
+    MAX_IMAGE_WIDTH,
+    MAX_UPLOAD_BYTES,
+    MODEL_DISCOVERY_RATE_LIMIT_PER_MINUTE,
+    RATE_LIMIT_PER_MINUTE,
+    REQUEST_TIMEOUT_SECONDS,
+    STATIC_DIR,
+    TRANSLATE_RATE_LIMIT_PER_MINUTE,
+)
 from app.pipeline import MangaTranslationPipeline
 from app.renderer import RenderOptions
 from app.provider_store import (
@@ -47,8 +66,109 @@ async def lifespan(app: FastAPI):
 _ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
 ] or ["*"]
-_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
-_MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "300"))
+
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+_gpu_semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENT_GPU_JOBS))
+_rate_lock = threading.Lock()
+_rate_buckets: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+
+
+def _get_configured_api_key() -> str:
+    return os.getenv("KOMAWEAVE_API_KEY", "").strip()
+
+
+def _client_ip(request: Request) -> str:
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _check_rate_limit(request: Request, bucket: str, limit_per_minute: int) -> None:
+    if limit_per_minute <= 0:
+        return
+    now = time.monotonic()
+    cutoff = now - 60.0
+    key = (_client_ip(request), bucket)
+    with _rate_lock:
+        dq = _rate_buckets[key]
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= limit_per_minute:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please wait before retrying.",
+                headers={"Retry-After": "60"},
+            )
+        dq.append(now)
+
+
+def _require_auth(request: Request) -> None:
+    expected = _get_configured_api_key()
+    if not expected:
+        return
+    provided = request.headers.get("X-API-Key", "").strip()
+    if not provided:
+        auth = request.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: valid X-API-Key or Authorization: Bearer token required.",
+        )
+
+
+def _rate_dep(bucket: str, limit: int):
+    def _dep(request: Request) -> None:
+        _check_rate_limit(request, bucket, limit)
+
+    return _dep
+
+
+async def _read_upload_limited(upload: UploadFile, max_bytes: int, label: str = "File") -> bytes:
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{label} exceeds maximum allowed size ({max_bytes // (1024 * 1024)} MB).",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _validate_and_decode_image(raw: bytes, filename: str) -> np.ndarray:
+    try:
+        with Image.open(io.BytesIO(raw)) as pil_img:
+            w, h = pil_img.size
+    except Image.DecompressionBombError:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image '{filename}' exceeds maximum allowed pixel count ({MAX_IMAGE_PIXELS:,}).",
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid or unsupported image file: {filename}")
+
+    if w <= 0 or h <= 0 or w > MAX_IMAGE_WIDTH or h > MAX_IMAGE_HEIGHT or (w * h) > MAX_IMAGE_PIXELS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Image '{filename}' dimensions ({w}x{h}) exceed limits "
+                f"(max {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}, {MAX_IMAGE_PIXELS:,} pixels)."
+            ),
+        )
+
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail=f"Invalid or unsupported image file: {filename}")
+    return img_bgr
+
 
 app = FastAPI(title="KomaWeave", version="1.0.0", lifespan=lifespan)
 
@@ -58,6 +178,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _api_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method != "OPTIONS" and path.startswith("/api/") and path != "/api/health":
+        expected = _get_configured_api_key()
+        if expected:
+            provided = request.headers.get("X-API-Key", "").strip()
+            if not provided:
+                auth = request.headers.get("Authorization", "").strip()
+                if auth.lower().startswith("bearer "):
+                    provided = auth[7:].strip()
+            if not provided or not hmac.compare_digest(provided, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: valid X-API-Key or Authorization: Bearer token required."},
+                )
+    return await call_next(request)
 
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -100,6 +239,7 @@ async def health():
         "aot_loaded": aot_loaded,
         "ocr_cuda": bool(_pipeline._ocr.use_cuda) if ocr_loaded else False,
         "device": device_name,
+        "auth_required": bool(_get_configured_api_key()),
     }
 
 
@@ -112,14 +252,12 @@ async def list_fonts():
     return {"fonts": fonts}
 
 
-@app.post("/api/fonts")
+@app.post("/api/fonts", dependencies=[Depends(_rate_dep("api", RATE_LIMIT_PER_MINUTE))])
 async def upload_font(file: UploadFile = File(...)):
     safe_name = Path(file.filename or "custom_font.ttf").name
     if Path(safe_name).suffix.lower() not in {".ttf", ".otf"}:
         raise HTTPException(status_code=400, detail="Only .ttf and .otf font files are supported.")
-    raw = await file.read()
-    if len(raw) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Font file exceeds 15 MB limit.")
+    raw = await _read_upload_limited(file, 15 * 1024 * 1024, label="Font file")
     try:
         ImageFont.truetype(io.BytesIO(raw), size=16)
     except Exception:
@@ -140,9 +278,7 @@ async def _build_render_options(
     font_path: Optional[Path] = None
     font_bytes: Optional[bytes] = None
     if font_file is not None and font_file.filename:
-        raw = await font_file.read()
-        if len(raw) > 15 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Font file exceeds 15 MB limit.")
+        raw = await _read_upload_limited(font_file, 15 * 1024 * 1024, label="Font file")
         try:
             ImageFont.truetype(io.BytesIO(raw), size=16)
         except Exception:
@@ -224,7 +360,7 @@ async def remove_provider_key(provider_id: str):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/providers/{provider_id}/models")
+@app.post("/api/providers/{provider_id}/models", dependencies=[Depends(_rate_dep("models", MODEL_DISCOVERY_RATE_LIMIT_PER_MINUTE))])
 async def discover_provider_models(provider_id: str, body: ProviderModelsReq):
     try:
         models = await fetch_provider_models(
@@ -237,7 +373,7 @@ async def discover_provider_models(provider_id: str, body: ProviderModelsReq):
         raise HTTPException(status_code=502, detail=f"Failed to fetch models: {e}")
 
 
-@app.post("/api/translate")
+@app.post("/api/translate", dependencies=[Depends(_rate_dep("translate", TRANSLATE_RATE_LIMIT_PER_MINUTE))])
 async def translate_image(
     file: UploadFile = File(...),
     target_lang: str = Form("ar"),
@@ -260,35 +396,35 @@ async def translate_image(
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline is still initializing.")
 
-    raw = await file.read()
-    if len(raw) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds maximum allowed size ({_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
-        )
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        raise HTTPException(status_code=400, detail="Invalid or unsupported image file.")
+    safe_name = Path(file.filename or "image.png").name
+    raw = await _read_upload_limited(file, MAX_UPLOAD_BYTES, label=f"File '{safe_name}'")
+    img_bgr = await asyncio.to_thread(_validate_and_decode_image, raw, safe_name)
+    del raw
 
     render_opts = await _build_render_options(
         font_name, font_file, font_scale, text_color, outline_enabled
     )
 
     try:
-        result = await _pipeline.process(
-            img_bgr,
-            target_lang=target_lang,
-            source_lang=source_lang,
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            mode=mode,
-            ocr_model=ocr_model,
-            inpaint_mode=inpaint_mode,
-            render_options=render_opts,
-        )
+        async with _gpu_semaphore:
+            result = await asyncio.wait_for(
+                _pipeline.process(
+                    img_bgr,
+                    target_lang=target_lang,
+                    source_lang=source_lang,
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    mode=mode,
+                    ocr_model=ocr_model,
+                    inpaint_mode=inpaint_mode,
+                    render_options=render_opts,
+                ),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Translation request timed out.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -330,7 +466,7 @@ async def translate_image(
     )
 
 
-@app.post("/api/translate-batch")
+@app.post("/api/translate-batch", dependencies=[Depends(_rate_dep("translate", TRANSLATE_RATE_LIMIT_PER_MINUTE))])
 async def translate_batch(
     files: List[UploadFile] = File(...),
     target_lang: str = Form("ar"),
@@ -355,54 +491,52 @@ async def translate_batch(
         raise HTTPException(status_code=503, detail="Pipeline is still initializing.")
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
-    if len(files) > _MAX_BATCH_FILES:
+    if len(files) > MAX_BATCH_FILES:
         raise HTTPException(
             status_code=400,
-            detail=f"Batch exceeds maximum allowed file count ({_MAX_BATCH_FILES}).",
+            detail=f"Batch exceeds maximum allowed file count ({MAX_BATCH_FILES}).",
         )
 
-    raw_bytes_list = await asyncio.gather(*(f.read() for f in files))
-    for idx, raw in enumerate(raw_bytes_list):
-        if len(raw) > _MAX_UPLOAD_BYTES:
-            safe_name = Path(files[idx].filename or f"page_{idx + 1}.jpg").name
+    imgs_bgr: List[np.ndarray] = []
+    total_batch_bytes = 0
+    for idx, f in enumerate(files):
+        safe_name = Path(f.filename or f"page_{idx + 1}.jpg").name
+        raw = await _read_upload_limited(f, MAX_UPLOAD_BYTES, label=f"File '{safe_name}'")
+        total_batch_bytes += len(raw)
+        if total_batch_bytes > MAX_BATCH_TOTAL_BYTES:
             raise HTTPException(
                 status_code=413,
-                detail=f"File '{safe_name}' exceeds maximum allowed size ({_MAX_UPLOAD_BYTES // (1024 * 1024)} MB).",
+                detail=f"Batch aggregate payload exceeds maximum allowed size ({MAX_BATCH_TOTAL_BYTES // (1024 * 1024)} MB).",
             )
-
-    def _decode_all() -> List[np.ndarray]:
-        imgs: List[np.ndarray] = []
-        for idx, raw in enumerate(raw_bytes_list):
-            arr = np.frombuffer(raw, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid or unsupported image file: {files[idx].filename}",
-                )
-            imgs.append(img)
-        return imgs
+        img = await asyncio.to_thread(_validate_and_decode_image, raw, safe_name)
+        imgs_bgr.append(img)
+        del raw
 
     render_opts = await _build_render_options(
         font_name, font_file, font_scale, text_color, outline_enabled
     )
 
-    imgs_bgr = await asyncio.to_thread(_decode_all)
     try:
-        results, chapter_timings = await _pipeline.process_chapter(
-            imgs_bgr,
-            target_lang=target_lang,
-            source_lang=source_lang,
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            consolidated=consolidated,
-            mode=mode,
-            ocr_model=ocr_model,
-            inpaint_mode=inpaint_mode,
-            render_options=render_opts,
-        )
+        async with _gpu_semaphore:
+            results, chapter_timings = await asyncio.wait_for(
+                _pipeline.process_chapter(
+                    imgs_bgr,
+                    target_lang=target_lang,
+                    source_lang=source_lang,
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    base_url=base_url,
+                    consolidated=consolidated,
+                    mode=mode,
+                    ocr_model=ocr_model,
+                    inpaint_mode=inpaint_mode,
+                    render_options=render_opts,
+                ),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Batch translation request timed out.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -467,7 +601,7 @@ async def translate_batch(
     )
 
 
-@app.post("/api/ocr")
+@app.post("/api/ocr", dependencies=[Depends(_rate_dep("translate", TRANSLATE_RATE_LIMIT_PER_MINUTE))])
 async def ocr_only(
     files: List[UploadFile] = File(...),
     consolidated: bool = Form(True),

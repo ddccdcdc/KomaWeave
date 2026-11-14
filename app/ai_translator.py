@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.config import LANGUAGES
-from app.provider_store import PROVIDERS, get_provider_secret
+from app.provider_store import PROVIDERS, get_provider_secret, validate_base_url
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _JSON_ARR_RE = re.compile(r"\[.*\]", re.DOTALL)
@@ -29,6 +29,7 @@ class AITranslator:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=self._timeout,
+                follow_redirects=False,
                 limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
             )
         return self._client
@@ -82,6 +83,8 @@ class AITranslator:
             'Reply ONLY JSON: {"t":[...]} matching exact input count & order.'
         )
         user_payload = json.dumps(lines, ensure_ascii=False)
+        if PROVIDERS.get(provider_id, {}).get("supports_custom_url"):
+            base_url = validate_base_url(base_url)
         client = await self._get_client()
 
         async with self._sem:

@@ -37,7 +37,7 @@ KomaWeave source code is licensed under the **GNU Affero General Public License 
 - **Pepper&Carrot Episode 1: "The Potion of Flight" (`pepper_1.jpg`, `pepper_2.jpg`, and translated variants)**
   - **Author:** David Revoy (`https://www.peppercarrot.com`)
   - **License:** Creative Commons Attribution 4.0 International (CC BY 4.0 — `https://creativecommons.org/licenses/by/4.0/`)
-  - **Changes Made:** `pepper_1_ar.jpg`, `pepper_1_zh.jpg`, `pepper_2_ar.jpg`, and `pepper_2_zh.jpg` are derivative translations into Arabic and Chinese Simplified generated and typeset with KomaWeave.
+  - **Changes Made:** `pepper_*_ar.jpg`, `pepper_*_zh.jpg`, `pepper_*_es.jpg`, and `pepper_*_fr.jpg` are derivative translations into Arabic, Chinese Simplified, Spanish, and French generated and typeset with KomaWeave.
 
 ---
 

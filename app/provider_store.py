@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
 
-from app.config import BASE_DIR
+from app.config import ALLOW_LOCAL_PROVIDER_URLS, BASE_DIR
 
 SECRETS_PATH = BASE_DIR / ".secrets.json"
 
@@ -76,7 +78,7 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "name": "Custom (OpenAI-Compatible)",
         "requires_key": True,
         "supports_custom_url": True,
-        "base_url": "http://localhost:11434/v1",
+        "base_url": "",
         "default_model": "",
     },
 }
@@ -100,13 +102,57 @@ def _save_raw(data: Dict[str, Dict[str, str]]) -> None:
         pass
 
 
-def _validate_base_url(url: str) -> str:
+def _is_disallowed_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address, allow_loopback: bool) -> bool:
+    if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_reserved:
+        return True
+    if ip_obj.is_loopback:
+        return not allow_loopback
+    if ip_obj.is_private:
+        return True
+    return False
+
+
+def validate_base_url(url: str) -> str:
     cleaned = url.strip().rstrip("/")
     if not cleaned:
         return ""
     parsed = urlparse(cleaned)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError("base_url must be a valid http:// or https:// URL.")
+    if parsed.username or parsed.password:
+        raise ValueError("base_url must not contain embedded credentials.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base_url must not contain query parameters or fragments.")
+
+    host = parsed.hostname.lower()
+    allow_local = ALLOW_LOCAL_PROVIDER_URLS or (os.getenv("KOMAWEAVE_ALLOW_LOCAL_PROVIDERS", "0") == "1")
+    is_explicit_localhost = host in {"localhost", "127.0.0.1", "::1"}
+    if not (allow_local and is_explicit_localhost):
+        if host in {"localhost", "127.0.0.1", "::1", "metadata.google.internal"}:
+            raise ValueError(
+                "Loopback/local provider URLs are blocked by SSRF policy. "
+                "Set KOMAWEAVE_ALLOW_LOCAL_PROVIDERS=1 to allow localhost."
+            )
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve provider host '{host}': {exc}") from exc
+    if not infos:
+        raise ValueError(f"No IP addresses resolved for provider host '{host}'.")
+
+    for info in infos:
+        raw_ip = info[4][0].split("%")[0]
+        try:
+            ip_obj = ipaddress.ip_address(raw_ip)
+        except ValueError as exc:
+            raise ValueError(f"Invalid IP address resolved for '{host}'.") from exc
+        if _is_disallowed_ip(ip_obj, allow_loopback=(allow_local and is_explicit_localhost)):
+            raise ValueError(
+                f"Blocked provider IP '{ip_obj}' (loopback, private, link-local, or metadata addresses are not allowed)."
+            )
+
     return cleaned
 
 
@@ -138,7 +184,7 @@ def save_provider_secret(
     if base_url is not None:
         if not PROVIDERS[provider_id].get("supports_custom_url") and base_url.strip():
             raise ValueError(f"Provider '{provider_id}' does not support a custom base_url.")
-        entry["base_url"] = _validate_base_url(base_url)
+        entry["base_url"] = validate_base_url(base_url)
     if selected_model is not None:
         entry["selected_model"] = selected_model.strip()
     raw[provider_id] = entry
@@ -184,12 +230,18 @@ async def fetch_provider_models(
 
     saved = get_provider_secret(provider_id)
     key = (api_key or "").strip() or saved.get("api_key", "")
-    url = (base_url or "").strip().rstrip("/") or saved.get("base_url") or PROVIDERS[provider_id]["base_url"]
+    if PROVIDERS[provider_id].get("supports_custom_url"):
+        raw_url = (base_url or "").strip().rstrip("/") or saved.get("base_url") or PROVIDERS[provider_id]["base_url"]
+        url = validate_base_url(raw_url)
+    else:
+        url = PROVIDERS[provider_id]["base_url"]
 
+    if not url:
+        raise ValueError("base_url is required for custom provider.")
     if not key and provider_id != "custom":
         raise ValueError("API key is required to fetch models.")
 
-    async with httpx.AsyncClient(timeout=12.0) as client:
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=False) as client:
         if provider_id == "gemini":
             resp = await client.get(f"{url}/models", params={"key": key})
             resp.raise_for_status()

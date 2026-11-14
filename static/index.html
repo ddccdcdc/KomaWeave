@@ -286,17 +286,45 @@
     let viewMode = 'result';
     let providersMap = {};
 
+    function getServerApiKey() {
+      return sessionStorage.getItem('komaweave_api_key') || '';
+    }
+
+    async function apiFetch(url, options = {}) {
+      const headers = new Headers(options.headers || {});
+      const key = getServerApiKey();
+      if (key) headers.set('X-API-Key', key);
+      let res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        const entered = window.prompt('Enter KomaWeave Server API Key (KOMAWEAVE_API_KEY):');
+        if (entered && entered.trim()) {
+          sessionStorage.setItem('komaweave_api_key', entered.trim());
+          headers.set('X-API-Key', entered.trim());
+          res = await fetch(url, { ...options, headers });
+        }
+      }
+      return res;
+    }
+
     async function init() {
       try {
-        const [hRes, lRes, pRes] = await Promise.all([
-          fetch('/api/health'),
-          fetch('/api/languages'),
-          fetch('/api/providers'),
-        ]);
+        const hRes = await fetch('/api/health');
         const h = await hRes.json();
         statusDot.classList.toggle('ready', h.status === 'ready');
         statusText.textContent = h.status === 'ready' ? 'Ready' : 'Initializing';
         deviceBadge.textContent = h.device;
+
+        if (h.auth_required && !getServerApiKey()) {
+          const entered = window.prompt('This KomaWeave server requires an API key (KOMAWEAVE_API_KEY):');
+          if (entered && entered.trim()) {
+            sessionStorage.setItem('komaweave_api_key', entered.trim());
+          }
+        }
+
+        const [lRes, pRes] = await Promise.all([
+          apiFetch('/api/languages'),
+          apiFetch('/api/providers'),
+        ]);
 
         const l = await lRes.json();
         Object.entries(l.languages).forEach(([code, name]) => {
@@ -347,7 +375,7 @@
       refreshModelsBtn.disabled = true;
       refreshModelsBtn.textContent = '...';
       try {
-        const res = await fetch(`/api/providers/${pid}/models`, {
+        const res = await apiFetch(`/api/providers/${pid}/models`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -388,7 +416,7 @@
 
     saveKeyBtn.addEventListener('click', async () => {
       const pid = providerSelect.value;
-      const res = await fetch(`/api/providers/${pid}/config`, {
+      const res = await apiFetch(`/api/providers/${pid}/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -408,7 +436,7 @@
 
     clearKeyBtn.addEventListener('click', async () => {
       const pid = providerSelect.value;
-      const res = await fetch(`/api/providers/${pid}/key`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/providers/${pid}/key`, { method: 'DELETE' });
       const data = await res.json();
       if (res.ok) {
         providersMap[pid] = data.provider;
@@ -516,7 +544,7 @@
       try {
         if (selectedFiles.length === 1) {
           fd.append('file', selectedFiles[0]);
-          const res = await fetch('/api/translate', { method: 'POST', body: fd });
+          const res = await apiFetch('/api/translate', { method: 'POST', body: fd });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Translation failed');
           batchResults = [data];
@@ -532,7 +560,7 @@
         } else {
           selectedFiles.forEach((f) => fd.append('files', f));
           fd.append('consolidated', consolidatedChk.checked ? 'true' : 'false');
-          const res = await fetch('/api/translate-batch', { method: 'POST', body: fd });
+          const res = await apiFetch('/api/translate-batch', { method: 'POST', body: fd });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Batch translation failed');
           batchResults = data.results;
