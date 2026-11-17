@@ -139,11 +139,16 @@ class GeneralOCREngine:
             }
         )
 
-    def ensure_fast_pool(self, workers: int = 4) -> List[RapidOCR]:
+    def ensure_fast_pool(self, workers: int = 4, fast_mode: bool = True) -> List[RapidOCR]:
         """Lazily initialize a thread-safe pool of CPU Rec workers for batch OCR."""
-        while len(self._rec_pool) < workers:
-            self._rec_pool.append(self._build_rec_engine(fast_mode=True))
-        return self._rec_pool[:workers]
+        attr = "_fast_rec_pool" if fast_mode else "_std_rec_pool"
+        pool = getattr(self, attr, None)
+        if pool is None:
+            pool = []
+            setattr(self, attr, pool)
+        while len(pool) < workers:
+            pool.append(self._build_rec_engine(fast_mode=fast_mode))
+        return pool[:workers]
 
     @staticmethod
     def _poly_angle(poly: np.ndarray) -> float:
@@ -500,11 +505,11 @@ class GeneralOCREngine:
         if n == 1:
             return [self.extract(images_bgr[0], ocr_model=ocr_model)]
 
-        use_tiny = ocr_model in {"auto", "tiny"}
+        use_tiny = (ocr_model == "tiny")
         det_eng = self.fast_det_engine if use_tiny else self.det_engine
         target_side = 800 if use_tiny else 1280
         det_td = det_eng.text_det
-        rec_pool = self.ensure_fast_pool(workers=min(4, max(2, workers)))
+        rec_pool = self.ensure_fast_pool(workers=min(4, max(2, workers)), fast_mode=use_tiny)
 
         # 1. Parallel CPU preprocess + pad to fixed square tensor so CUDA never re-tunes shapes
         with ThreadPoolExecutor(max_workers=8) as ex:
