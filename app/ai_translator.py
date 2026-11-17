@@ -193,13 +193,13 @@ class AITranslator:
         if not unique_map:
             return [r or "" for r in results]
 
-        # Aggregate unique lines into fast parallel chunks (<=15 blocks & <=1400 chars)
+        # Combine multiple items into consolidated chapter messages (<=100 blocks & <=5500 chars) to save API costs
         chunks: List[Tuple[List[List[int]], List[str]]] = []
         cur_idx: List[List[int]] = []
         cur_txt: List[str] = []
         cur_len = 0
         for txt, idxs in unique_map.items():
-            if cur_txt and (len(cur_txt) >= 15 or cur_len + len(txt) > 1400):
+            if cur_txt and (len(cur_txt) >= 100 or cur_len + len(txt) > 5500):
                 chunks.append((cur_idx, cur_txt))
                 cur_idx, cur_txt, cur_len = [], [], 0
             cur_idx.append(idxs)

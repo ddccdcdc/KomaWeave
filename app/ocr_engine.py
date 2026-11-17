@@ -117,6 +117,8 @@ class GeneralOCREngine:
             params={
                 "EngineConfig.onnxruntime.use_cuda": use_cuda,
                 "EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search": "HEURISTIC",
+                "EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy": "kSameAsRequested",
+                "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": 3 * 1024 * 1024 * 1024,
                 "Global.use_cls": False,
                 "Det.model_type": ModelType.TINY if fast_mode else ModelType.MEDIUM,
                 "Rec.model_type": ModelType.TINY if fast_mode else ModelType.SMALL,
@@ -152,14 +154,10 @@ class GeneralOCREngine:
 
     @staticmethod
     def _poly_angle(poly: np.ndarray) -> float:
-        """Compute dominant orientation angle in degrees (-90 to 90)."""
-        p0, p1, p2, p3 = poly
+        """Compute horizontal baseline tilt angle in degrees (-90 to 90) from top edge."""
+        p0, p1 = poly[0], poly[1]
         e_top = p1 - p0
-        e_side = p3 - p0
-        if np.linalg.norm(e_top) >= np.linalg.norm(e_side):
-            ang = math.degrees(math.atan2(e_top[1], e_top[0]))
-        else:
-            ang = math.degrees(math.atan2(e_side[1], e_side[0]))
+        ang = math.degrees(math.atan2(float(e_top[1]), float(e_top[0])))
         while ang > 90:
             ang -= 180
         while ang < -90:
@@ -167,7 +165,7 @@ class GeneralOCREngine:
         return ang
 
     @staticmethod
-    def _crop_poly(img_bgr: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    def _crop_poly(img_bgr: np.ndarray, poly: np.ndarray, rotate_vertical: bool = True) -> np.ndarray:
         pts = poly.astype(np.float32)
         w = int(max(np.linalg.norm(pts[1] - pts[0]), np.linalg.norm(pts[2] - pts[3])))
         h = int(max(np.linalg.norm(pts[3] - pts[0]), np.linalg.norm(pts[2] - pts[1])))
@@ -175,21 +173,28 @@ class GeneralOCREngine:
         dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
         M = cv2.getPerspectiveTransform(pts, dst)
         crop = cv2.warpPerspective(img_bgr, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-        if h >= w * 1.5:
+        if rotate_vertical and h >= w * 2.3:
             crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return crop
 
     def _retry_rotated_crops(
         self, img_bgr: np.ndarray, lines: List[TextLine], engine: RapidOCR | None = None
     ) -> None:
-        """For low-confidence vertical/sideways crops (e.g. rotated English), test 180-deg flip."""
+        """Recover orientation for ambiguous aspect-ratio crops or upside-down/sideways lines."""
         candidates: List[Tuple[int, np.ndarray]] = []
         for idx, ln in enumerate(lines):
-            # Sideways English or upside-down text often scores < 0.86 when rotated wrong
-            if ln.score < 0.88 and (ln.is_vertical or abs(ln.angle_deg) > 15):
+            aspect = ln.h / max(1.0, ln.w)
+            if 1.35 <= aspect < 2.3 and (ln.score < 0.88 or len(ln.text) <= 1):
+                # Was kept upright; test 90-deg CCW in case it is a short vertical CJK line
+                raw_crop = self._crop_poly(img_bgr, ln.poly, rotate_vertical=False)
+                candidates.append((idx, cv2.rotate(raw_crop, cv2.ROTATE_90_COUNTERCLOCKWISE)))
+            elif aspect >= 2.3 and (ln.score < 0.85 or (ln.text.isascii() and len(ln.text) <= 2)):
+                # Was rotated 90-deg CCW; test upright in case it is a narrow upright 'I' or '!'
+                raw_crop = self._crop_poly(img_bgr, ln.poly, rotate_vertical=False)
+                candidates.append((idx, raw_crop))
+            elif ln.score < 0.88 and (ln.is_vertical or abs(ln.angle_deg) > 15):
                 crop = self._crop_poly(img_bgr, ln.poly)
-                flipped = cv2.rotate(crop, cv2.ROTATE_180)
-                candidates.append((idx, flipped))
+                candidates.append((idx, cv2.rotate(crop, cv2.ROTATE_180)))
 
         if not candidates:
             return
@@ -202,27 +207,60 @@ class GeneralOCREngine:
 
         for (idx, _), new_txt, new_score in zip(candidates, rec_res.txts, rec_res.scores):
             new_txt = (new_txt or "").strip()
-            if new_txt and new_score > lines[idx].score + 0.05:
+            if new_txt and new_score > lines[idx].score + 0.04:
                 lines[idx].text = new_txt
                 lines[idx].score = float(new_score)
+                if new_txt.isascii() and len(new_txt) <= 4:
+                    lines[idx].is_vertical = False
+                    lines[idx].font_size = lines[idx].h
 
     @staticmethod
-    def _mark_furigana_and_noise(lines: List[TextLine]) -> List[TextLine]:
+    def _mark_furigana_and_noise(lines: List[TextLine], img_bgr: np.ndarray | None = None) -> List[TextLine]:
         """Flag tiny furigana ruby text beside main lines and drop pure graphic noise."""
+        ascii_lines = sum(1 for l in lines if any(c.isascii() and c.isalpha() for c in l.text))
+        mostly_ascii_page = ascii_lines >= 2 and ascii_lines >= 0.6 * max(1, len(lines))
+
         kept: List[TextLine] = []
         for i, a in enumerate(lines):
             txt = a.text.strip()
             if not txt:
                 continue
-            # Drop screentone/artwork numeric & low-confidence ASCII false positives
             if _NUM_GARBAGE_RE.match(txt) and len(txt) <= 12:
                 continue
-            if a.score < 0.45 and len(txt) <= 2:
+            if a.score < 0.62:
                 continue
             if a.score < 0.72 and _NOISE_RE.match(txt):
                 continue
-            if txt.isascii() and len(txt) <= 5 and a.score < 0.85:
-                continue
+
+            # Check if line has a neighbor in the same bubble
+            has_neighbor = False
+            for j, b in enumerate(lines):
+                if i == j or not b.text.strip():
+                    continue
+                ref = max(a.font_size, b.font_size, 12.0)
+                if abs(a.cx - b.cx) < 2.2 * ref and abs(a.cy - b.cy) < 2.6 * ref:
+                    has_neighbor = True
+                    break
+
+            if not has_neighbor:
+                # Drop isolated false positives on artwork (e.g. '开', '日', '口', 'aIr1', 'D', 'N')
+                if mostly_ascii_page and len(txt) <= 2 and not any(c.isascii() and c.isalpha() for c in txt):
+                    continue
+                if len(txt) == 1 and txt.isascii() and txt.upper() not in {"I", "A"}:
+                    continue
+                if txt.isascii() and len(txt) <= 5 and a.score < 0.78:
+                    continue
+                if a.score < 0.65:
+                    continue
+                if img_bgr is not None and len(txt) <= 3 and a.score < 0.90:
+                    ih, iw = img_bgr.shape[:2]
+                    rx0, ry0 = max(0, int(a.x0)), max(0, int(a.y0))
+                    rx1, ry1 = min(iw, int(a.x1)), min(ih, int(a.y1))
+                    if rx1 > rx0 and ry1 > ry0:
+                        patch = cv2.cvtColor(img_bgr[ry0:ry1, rx0:rx1], cv2.COLOR_BGR2GRAY)
+                        # Real bubble interiors have bright uniform background (85th percentile > 220)
+                        if float(np.percentile(patch, 85)) < 200.0 and float(np.percentile(patch, 15)) > 35.0:
+                            continue
 
             is_furi = False
             for j, b in enumerate(lines):
@@ -249,30 +287,54 @@ class GeneralOCREngine:
         return kept
 
     @staticmethod
-    def _should_merge(a: TextLine, b: TextLine) -> bool:
-        """Orientation-aware & scale-aware merge check so clustered SFX stay separate."""
+    def _has_border_between(img_bgr: np.ndarray | None, a: TextLine, b: TextLine) -> bool:
+        """Check if a dark bubble outline or panel border separates two vertically stacked lines."""
+        if img_bgr is None:
+            return False
+        top, bot = (a, b) if a.cy <= b.cy else (b, a)
+        ih, iw = img_bgr.shape[:2]
+        x0 = max(0, int(min(top.cx, bot.cx) - 0.25 * min(top.w, bot.w)))
+        x1 = min(iw, int(max(top.cx, bot.cx) + 0.25 * min(top.w, bot.w)))
+        y0 = max(0, int(top.y1))
+        y1 = min(ih, int(bot.y0))
+        if x1 <= x0 + 2 or y1 <= y0 + 2:
+            return False
+        gap_strip = cv2.cvtColor(img_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        # If there is a solid dark horizontal line (row mean < 150) across the gap, a border separates them
+        row_means = gap_strip.mean(axis=1)
+        return bool(np.min(row_means) < 150.0)
+
+    @classmethod
+    def _should_merge(cls, a: TextLine, b: TextLine, img_bgr: np.ndarray | None = None) -> bool:
+        """Orientation-aware & bubble-aware merge check so lines in the same bubble always group."""
         if a.is_vertical != b.is_vertical:
             return False
         ang_diff = abs(a.angle_deg - b.angle_deg) % 180.0
         ang_diff = min(ang_diff, 180.0 - ang_diff)
-        if ang_diff > 18.0:
+        if ang_diff > 20.0:
             return False
         fs_ratio = max(a.font_size, b.font_size) / max(1.0, min(a.font_size, b.font_size))
-        if fs_ratio > 1.35:
+        short_line = len(a.text.strip()) <= 3 or len(b.text.strip()) <= 3
+        if fs_ratio > (2.2 if short_line else 1.55):
             return False
 
-        ref_fs = min(a.font_size, b.font_size)
+        ref_fs = max(a.font_size, b.font_size)
         if a.is_vertical:
             y_ov = min(a.y1, b.y1) - max(a.y0, b.y0)
             x_gap = max(0.0, max(a.x0 - b.x1, b.x0 - a.x1))
-            # Same vertical column split into top/bottom segments OR adjacent columns in same bubble
             same_col = abs(a.cx - b.cx) < 0.65 * ref_fs and max(0.0, max(a.y0 - b.y1, b.y0 - a.y1)) < 1.8 * ref_fs
             adj_col = y_ov > 0.15 * min(a.h, b.h) and x_gap < 1.75 * ref_fs
             return same_col or adj_col
         else:
             x_ov = min(a.x1, b.x1) - max(a.x0, b.x0)
             y_gap = max(0.0, max(a.y0 - b.y1, b.y0 - a.y1))
-            return x_ov > 0.25 * min(a.w, b.w) and y_gap < 0.55 * ref_fs
+            center_aligned = abs(a.cx - b.cx) <= 0.55 * max(a.w, b.w)
+            horiz_ok = (x_ov > 0.12 * min(a.w, b.w)) or center_aligned
+            if not horiz_ok or y_gap > 1.35 * ref_fs:
+                return False
+            if y_gap > 0.45 * ref_fs and cls._has_border_between(img_bgr, a, b):
+                return False
+            return True
 
     @staticmethod
     def _sort_horizontal_group(grp: List[TextLine]) -> List[TextLine]:
@@ -399,12 +461,13 @@ class GeneralOCREngine:
             x0, y0 = float(poly[:, 0].min()), float(poly[:, 1].min())
             x1, y1 = float(poly[:, 0].max()), float(poly[:, 1].max())
             w, h = max(1.0, x1 - x0), max(1.0, y1 - y0)
-            is_vert = h > 1.35 * w
+            clean_txt = (txt or "").strip()
+            is_vert = (h > 1.35 * w) and not (clean_txt.isascii() and (len(clean_txt) <= 3 or h < 2.8 * w))
             fs = w if is_vert else h
             raw_lines.append(
                 TextLine(
                     poly=poly,
-                    text=(txt or "").strip(),
+                    text=clean_txt,
                     score=float(score),
                     x0=x0,
                     y0=y0,
@@ -421,7 +484,7 @@ class GeneralOCREngine:
             )
 
         self._retry_rotated_crops(image_bgr, raw_lines, engine=rec_engine)
-        lines = self._mark_furigana_and_noise(raw_lines)
+        lines = self._mark_furigana_and_noise(raw_lines, image_bgr)
         all_inpaint_polys = [ln.poly for ln in lines]
 
         main_lines = [ln for ln in lines if not ln.is_furigana]
@@ -440,7 +503,7 @@ class GeneralOCREngine:
 
         for i in range(n):
             for j in range(i + 1, n):
-                if self._should_merge(main_lines[i], main_lines[j]):
+                if self._should_merge(main_lines[i], main_lines[j], image_bgr):
                     ri, rj = find(i), find(j)
                     if ri != rj:
                         parent[rj] = ri
@@ -458,6 +521,9 @@ class GeneralOCREngine:
                 grp = self._sort_horizontal_group(grp)
 
             joined = " ".join(l.text for l in grp) if not is_vert else "".join(l.text for l in grp)
+            if not is_vert:
+                joined = re.sub(r"(?<![\u4e00-\u9fff])工(?=\s+[A-Za-z])", "I", joined)
+                joined = re.sub(r"([A-Za-z])-\s+([A-Za-z'])", r"\1\2", joined)
             bx0 = int(min(l.x0 for l in grp))
             by0 = int(min(l.y0 for l in grp))
             bx1 = int(max(l.x1 for l in grp))
@@ -515,11 +581,12 @@ class GeneralOCREngine:
         with ThreadPoolExecutor(max_workers=8) as ex:
             pre_list = list(ex.map(lambda im: self._prep_padded(det_td, im, target_side), images_bgr))
 
-        # 2. Run batched GPU Det (batch<=16) on unified (B, 3, 800, 800) tensor
+        # 2. Run GPU Det with bounded batch size (1 for 1280x1280 medium, 4 for 800x800 tiny) to keep VRAM < 1.5 GB
         valid_idxs = [i for i, p in enumerate(pre_list) if p is not None]
         det_preds: List[np.ndarray | None] = [None] * n
-        for start in range(0, len(valid_idxs), 16):
-            chunk_idxs = valid_idxs[start : start + 16]
+        step = 4 if use_tiny else 1
+        for start in range(0, len(valid_idxs), step):
+            chunk_idxs = valid_idxs[start : start + step]
             batch_np = np.concatenate([pre_list[i][0] for i in chunk_idxs], axis=0)
             out = det_td.session(batch_np)
             for k, orig_i in enumerate(chunk_idxs):

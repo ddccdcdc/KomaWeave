@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
 
 from app.ai_translator import AITranslator
 from app.image_slicer import smart_slice_vertical, stitch_vertical
@@ -131,6 +132,26 @@ class MangaTranslationPipeline:
             base_url=base_url,
         )
 
+    @staticmethod
+    def _seam_has_content(top_img: np.ndarray, bot_img: np.ndarray) -> bool:
+        """Return True only when non-margin content crosses the boundary between two strips."""
+        if top_img.shape[1] != bot_img.shape[1]:
+            return False
+        h1, w = top_img.shape[:2]
+        h2 = bot_img.shape[0]
+        if h1 < 24 or h2 < 24 or w < 32:
+            return False
+        x0, x1 = int(w * 0.05), int(w * 0.95)
+        b_strip = top_img[h1 - 10 : h1, x0:x1]
+        t_strip = bot_img[:10, x0:x1]
+        for s in (b_strip, t_strip):
+            std = float(np.std(s))
+            mean = float(np.mean(s))
+            # Clean white or black page margin at top/bottom edge -> no bubble crosses this seam
+            if std < 12.0 and (mean >= 238.0 or mean <= 18.0):
+                return False
+        return True
+
     async def process(
         self,
         image_bgr: np.ndarray,
@@ -149,7 +170,8 @@ class MangaTranslationPipeline:
             raise ValueError(f"Unsupported pipeline mode: {mode}. Use 'full', 'ocr', or 'clean'.")
 
         # Automatically slice ultra-long vertical webtoon/chapter strips at safe gutters
-        if image_bgr.shape[0] > 2600:
+        max_single_h = max(2600, int(round(image_bgr.shape[1] * 1.75)))
+        if image_bgr.shape[0] > max_single_h:
             results, _ = await self.process_chapter(
                 [image_bgr],
                 target_lang=target_lang,
@@ -275,13 +297,17 @@ class MangaTranslationPipeline:
         if not images_bgr:
             return [], {"ocr": 0.0, "translate": 0.0, "inpaint": 0.0, "render": 0.0, "total": 0.0}
 
-        # 0. Group consecutive same-width images when consolidated=True so bubbles split
-        # across image boundaries are joined before gutter-aware slicing.
+        # 0. Group consecutive same-width images when consolidated=True ONLY when content
+        # actually crosses the boundary seam (webtoon strips), keeping normal pages intact.
         runs: List[Tuple[int, int]] = []
         if consolidated and len(images_bgr) > 1:
             r_start = 0
             for idx in range(1, len(images_bgr)):
-                if images_bgr[idx].shape[1] != images_bgr[r_start].shape[1]:
+                can_join = (
+                    (idx - r_start) < 6
+                    and self._seam_has_content(images_bgr[idx - 1], images_bgr[idx])
+                )
+                if not can_join:
                     runs.append((r_start, idx))
                     r_start = idx
             runs.append((r_start, len(images_bgr)))
@@ -305,9 +331,18 @@ class MangaTranslationPipeline:
                 if (r_end - r_start) == 1
                 else np.vstack(images_bgr[r_start:r_end])
             )
+            w_run = run_canvas.shape[1]
+            max_slice_h = max(2600, int(round(w_run * 1.75)))
+            target_slice_h = max(2000, int(round(w_run * 1.40)))
+            min_slice_h = max(1000, int(round(w_run * 0.85)))
             s_start = len(slice_imgs)
-            if run_canvas.shape[0] > 2600:
-                for y0, _, s_img in smart_slice_vertical(run_canvas):
+            if run_canvas.shape[0] > max_slice_h:
+                for y0, _, s_img in smart_slice_vertical(
+                    run_canvas,
+                    target_height=target_slice_h,
+                    min_height=min_slice_h,
+                    max_height=max_slice_h,
+                ):
                     slice_imgs.append(s_img)
                     slice_y_offsets.append(y0)
             else:
@@ -444,6 +479,10 @@ class MangaTranslationPipeline:
             del stitched_run
 
         final_results: List[PipelineResult] = [r for r in results if r is not None]
+        n_slices = len(slice_imgs)
+        del slice_imgs, inpainted_list, rendered_slices
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         chapter_timings = {
             "ocr": round(t_ocr, 1),
@@ -452,7 +491,7 @@ class MangaTranslationPipeline:
             "render": round(t_render, 1),
             "total": round(total_ms, 1),
             "per_image_avg": round(total_ms / n, 1),
-            "slices_processed": len(slice_imgs),
+            "slices_processed": n_slices,
         }
         return final_results, chapter_timings
 

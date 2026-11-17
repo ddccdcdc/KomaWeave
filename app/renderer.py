@@ -293,8 +293,11 @@ class MangaRenderer:
             ang_std = float(np.std([l.angle_deg for l in blk.lines])) if blk.lines else 0.0
             angled = (not blk.is_vertical) and (8.0 < abs(blk.angle_deg) < 72.0) and ang_std < 12.0
 
-            # Safely expand narrow 1-column bubbles ONLY within uniform bubble interior (never cross borders!)
-            if (not tall_vertical) and bw < 96 and bh > bw * 1.4:
+            # Safely expand narrow bubbles ONLY within uniform bubble interior (scaled to page width)
+            narrow_thresh = max(96, int(pil_img.width * 0.18))
+            max_expand = max(24, int(pil_img.width * 0.045))
+            margin_pad = max(3, int(pil_img.width * 0.005))
+            if (not tall_vertical) and bw < narrow_thresh and bh > bw * 1.35:
                 gray = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
                 cy = (y0 + y1) // 2
                 cx = (x0 + x1) // 2
@@ -302,13 +305,14 @@ class MangaRenderer:
                 # Check if inside a uniform light or dark bubble
                 if center_val >= 235 or center_val <= 20:
                     lx_lim = x0
-                    while lx_lim > max(0, x0 - 24) and abs(int(gray[cy, lx_lim - 1]) - center_val) <= 25:
+                    while lx_lim > max(0, x0 - max_expand) and abs(int(gray[cy, lx_lim - 1]) - center_val) <= 25:
                         lx_lim -= 1
                     rx_lim = x1
-                    while rx_lim < min(pil_img.width, x1 + 24) and abs(int(gray[cy, rx_lim]) - center_val) <= 25:
+                    while rx_lim < min(pil_img.width, x1 + max_expand) and abs(int(gray[cy, rx_lim]) - center_val) <= 25:
                         rx_lim += 1
-                    x0, x1 = lx_lim + 3, rx_lim - 3
-                    bw = max(20, x1 - x0)
+                    if (rx_lim - lx_lim) > bw + 2 * margin_pad:
+                        x0, x1 = lx_lim + margin_pad, rx_lim - margin_pad
+                        bw = max(20, x1 - x0)
 
             if tall_vertical or angled:
                 render_angle = 90.0 if tall_vertical else blk.angle_deg

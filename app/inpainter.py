@@ -303,7 +303,8 @@ class SmartInpainter:
         if np.count_nonzero(stroke) < 0.03 * np.count_nonzero(poly_mask):
             stroke = poly_mask
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        k_sz = max(7, min(19, int(round(max(h, w) * 0.04)) | 1))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
         return cv2.dilate(stroke, kernel, iterations=1)
 
     @staticmethod
@@ -355,12 +356,13 @@ class SmartInpainter:
         solid_count = 0
         aot_count = 0
 
+        pad = max(10, int(round(max(h, w) * 0.006)))
         for poly in polygons:
             pts = np.asarray(poly, dtype=np.float32)
-            x0 = max(0, int(np.floor(pts[:, 0].min())) - 10)
-            y0 = max(0, int(np.floor(pts[:, 1].min())) - 10)
-            x1 = min(w, int(np.ceil(pts[:, 0].max())) + 10)
-            y1 = min(h, int(np.ceil(pts[:, 1].max())) + 10)
+            x0 = max(0, int(np.floor(pts[:, 0].min())) - pad)
+            y0 = max(0, int(np.floor(pts[:, 1].min())) - pad)
+            x1 = min(w, int(np.ceil(pts[:, 0].max())) + pad)
+            y1 = min(h, int(np.ceil(pts[:, 1].max())) + pad)
             if x1 <= x0 + 2 or y1 <= y0 + 2:
                 continue
 
