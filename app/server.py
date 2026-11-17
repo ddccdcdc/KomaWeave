@@ -428,7 +428,7 @@ async def translate_image(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Translation failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Translation failed: {type(e).__name__}: {e}")
 
     b64_data_uri: Optional[str] = (
         None if mode == "ocr" else _encode_image(result.image_bgr, output_format, output_quality)
@@ -540,7 +540,7 @@ async def translate_batch(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Batch translation failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Batch translation failed: {type(e).__name__}: {e}")
 
     def _encode_one(res) -> Optional[str]:
         if mode == "ocr":

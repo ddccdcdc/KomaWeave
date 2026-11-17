@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,8 +20,8 @@ _JSON_ARR_RE = re.compile(r"\[.*\]", re.DOTALL)
 class AITranslator:
     """Supports OpenAI, Gemini, DeepSeek, Anthropic, Groq, OpenRouter, and Custom OpenAI-compatible APIs."""
 
-    def __init__(self, timeout: float = 30.0, max_concurrency: int = 6) -> None:
-        self._timeout = timeout
+    def __init__(self, timeout: Optional[float] = None, max_concurrency: int = 6) -> None:
+        self._timeout = float(timeout if timeout is not None else os.getenv("AI_TRANSLATE_TIMEOUT", "120.0"))
         self._sem = asyncio.Semaphore(max_concurrency)
         self._cache: Dict[Tuple[str, str, str, str, str], str] = {}
         self._client: Optional[httpx.AsyncClient] = None
@@ -190,13 +191,13 @@ class AITranslator:
         if not uncached_txt:
             return [r or "" for r in results]
 
-        # Aggregate into large context-aware chunks (<=60 blocks & <=4500 chars)
+        # Aggregate into context-aware chunks (<=35 blocks & <=3000 chars)
         chunks: List[Tuple[List[int], List[str]]] = []
         cur_idx: List[int] = []
         cur_txt: List[str] = []
         cur_len = 0
         for idx, txt in zip(uncached_idx, uncached_txt):
-            if cur_txt and (len(cur_txt) >= 60 or cur_len + len(txt) > 4500):
+            if cur_txt and (len(cur_txt) >= 35 or cur_len + len(txt) > 3000):
                 chunks.append((cur_idx, cur_txt))
                 cur_idx, cur_txt, cur_len = [], [], 0
             cur_idx.append(idx)
@@ -206,9 +207,27 @@ class AITranslator:
             chunks.append((cur_idx, cur_txt))
 
         async def _run_chunk(c_idx: List[int], c_txt: List[str]) -> List[Tuple[int, str, str]]:
-            parsed = await self._call_provider(
-                provider_id, mdl, key, url, c_txt, target_lang, source_lang
-            )
+            last_exc: Optional[Exception] = None
+            parsed: Optional[List[str]] = None
+            for attempt in range(2):
+                try:
+                    parsed = await self._call_provider(
+                        provider_id, mdl, key, url, c_txt, target_lang, source_lang
+                    )
+                    last_exc = None
+                    break
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        await asyncio.sleep(1.5)
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    if attempt == 0 and exc.response.status_code in {429, 500, 502, 503, 504}:
+                        await asyncio.sleep(2.0)
+                    else:
+                        raise
+            if last_exc is not None:
+                raise last_exc
             if parsed is not None and len(parsed) == len(c_txt):
                 return list(zip(c_idx, c_txt, parsed))
             if len(c_txt) == 1:
