@@ -17,10 +17,13 @@ _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 _JSON_ARR_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 
+_PURE_PUNCT_RE = re.compile(r"^[\s\d\.\,\!\?\-\—\–\…\~\*\(\)\[\]\{\}\:\;\'\"\/\\]+$")
+
+
 class AITranslator:
     """Supports OpenAI, Gemini, DeepSeek, Anthropic, Groq, OpenRouter, and Custom OpenAI-compatible APIs."""
 
-    def __init__(self, timeout: Optional[float] = None, max_concurrency: int = 6) -> None:
+    def __init__(self, timeout: Optional[float] = None, max_concurrency: int = 16) -> None:
         self._timeout = float(timeout if timeout is not None else os.getenv("AI_TRANSLATE_TIMEOUT", "120.0"))
         self._sem = asyncio.Semaphore(max_concurrency)
         self._cache: Dict[Tuple[str, str, str, str, str], str] = {}
@@ -31,7 +34,7 @@ class AITranslator:
             self._client = httpx.AsyncClient(
                 timeout=self._timeout,
                 follow_redirects=False,
-                limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
             )
         return self._client
 
@@ -78,10 +81,9 @@ class AITranslator:
         lang_name = LANGUAGES.get(target_lang, target_lang)
         src_hint = f" from {LANGUAGES.get(source_lang, source_lang)}" if source_lang != "auto" else ""
         sys_prompt = (
-            f"Manga/manhwa translator{src_hint} to {lang_name}. "
-            "Use full scene context: preserve character gender, pronouns & tone; "
-            "adapt SFX naturally; fix obvious OCR typos. "
-            'Reply ONLY JSON: {"t":[...]} matching exact input count & order.'
+            f"Manga translator{src_hint}->{lang_name}. "
+            "Preserve tone/gender/SFX, fix OCR typos. "
+            f'Reply ONLY JSON {{"t":[...]}} with {len(lines)} strings.'
         )
         user_payload = json.dumps(lines, ensure_ascii=False)
         if PROVIDERS.get(provider_id, {}).get("supports_custom_url"):
@@ -175,38 +177,38 @@ class AITranslator:
             raise ValueError(f"No model selected for {PROVIDERS[provider_id]['name']}.")
 
         results: List[Optional[str]] = [None] * len(texts)
-        uncached_idx: List[int] = []
-        uncached_txt: List[str] = []
+        unique_map: Dict[str, List[int]] = {}
         for i, t in enumerate(texts):
             clean = t.strip()
             ckey = (provider_id, mdl, source_lang, target_lang, clean)
             if not clean:
                 results[i] = ""
+            elif _PURE_PUNCT_RE.match(clean):
+                results[i] = clean
             elif ckey in self._cache:
                 results[i] = self._cache[ckey]
             else:
-                uncached_idx.append(i)
-                uncached_txt.append(clean)
+                unique_map.setdefault(clean, []).append(i)
 
-        if not uncached_txt:
+        if not unique_map:
             return [r or "" for r in results]
 
-        # Aggregate into context-aware chunks (<=35 blocks & <=3000 chars)
-        chunks: List[Tuple[List[int], List[str]]] = []
-        cur_idx: List[int] = []
+        # Aggregate unique lines into fast parallel chunks (<=15 blocks & <=1400 chars)
+        chunks: List[Tuple[List[List[int]], List[str]]] = []
+        cur_idx: List[List[int]] = []
         cur_txt: List[str] = []
         cur_len = 0
-        for idx, txt in zip(uncached_idx, uncached_txt):
-            if cur_txt and (len(cur_txt) >= 35 or cur_len + len(txt) > 3000):
+        for txt, idxs in unique_map.items():
+            if cur_txt and (len(cur_txt) >= 15 or cur_len + len(txt) > 1400):
                 chunks.append((cur_idx, cur_txt))
                 cur_idx, cur_txt, cur_len = [], [], 0
-            cur_idx.append(idx)
+            cur_idx.append(idxs)
             cur_txt.append(txt)
             cur_len += len(txt) + 4
         if cur_txt:
             chunks.append((cur_idx, cur_txt))
 
-        async def _run_chunk(c_idx: List[int], c_txt: List[str]) -> List[Tuple[int, str, str]]:
+        async def _run_chunk(c_idx: List[List[int]], c_txt: List[str]) -> List[Tuple[List[int], str, str]]:
             last_exc: Optional[Exception] = None
             parsed: Optional[List[str]] = None
             for attempt in range(2):
@@ -219,11 +221,11 @@ class AITranslator:
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     last_exc = exc
                     if attempt == 0:
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(1.0)
                 except httpx.HTTPStatusError as exc:
                     last_exc = exc
                     if attempt == 0 and exc.response.status_code in {429, 500, 502, 503, 504}:
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(1.5)
                     else:
                         raise
             if last_exc is not None:
@@ -241,9 +243,10 @@ class AITranslator:
 
         chunk_outputs = await asyncio.gather(*(_run_chunk(ci, ct) for ci, ct in chunks))
         for out in chunk_outputs:
-            for idx, src, dst in out:
+            for idxs, src, dst in out:
                 self._cache[(provider_id, mdl, source_lang, target_lang, src)] = dst
-                results[idx] = dst
+                for idx in idxs:
+                    results[idx] = dst
 
         return [r or "" for r in results]
 

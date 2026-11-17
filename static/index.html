@@ -159,10 +159,18 @@
       </div>
 
       <div id="dropzone" class="dropzone">
-        <strong>Drop image(s) or click to browse</strong>
-        <small>Single page, ultra-long strip, or chapter batch</small>
+        <strong>Drop image(s) or chapter folder(s) here</strong>
+        <small>Max 25 MB/image · 8192×16384 px · Single page, strip, or multi-chapter folders</small>
+        <div style="display:flex;gap:0.4rem;justify-content:center;flex-wrap:wrap;margin-top:0.55rem;" onclick="event.stopPropagation()">
+          <button type="button" id="pickImagesBtn" class="secondary outline" style="padding:0.35rem 0.65rem;font-size:0.78rem;width:auto;margin:0;">Select Images</button>
+          <button type="button" id="pickFolderBtn" class="secondary outline" style="padding:0.35rem 0.65rem;font-size:0.78rem;width:auto;margin:0;">Select Folder</button>
+          <button type="button" id="addFolderBtn" class="secondary outline" style="padding:0.35rem 0.65rem;font-size:0.78rem;width:auto;margin:0;">+ Add Chapter Folder</button>
+          <button type="button" id="clearQueueBtn" class="secondary outline" hidden style="padding:0.35rem 0.65rem;font-size:0.78rem;width:auto;margin:0;">Clear</button>
+        </div>
         <div id="fileName" class="file-summary"></div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden />
+        <input type="file" id="folderInput" webkitdirectory directory multiple hidden />
+        <input type="file" id="addFolderInput" webkitdirectory directory multiple hidden />
       </div>
 
       <label for="providerSelect">Translation Provider</label>
@@ -253,6 +261,12 @@
 
   <script>
     const fileInput = document.getElementById('fileInput');
+    const folderInput = document.getElementById('folderInput');
+    const addFolderInput = document.getElementById('addFolderInput');
+    const pickImagesBtn = document.getElementById('pickImagesBtn');
+    const pickFolderBtn = document.getElementById('pickFolderBtn');
+    const addFolderBtn = document.getElementById('addFolderBtn');
+    const clearQueueBtn = document.getElementById('clearQueueBtn');
     const dropzone = document.getElementById('dropzone');
     const fileNameEl = document.getElementById('fileName');
     const targetLangEl = document.getElementById('targetLang');
@@ -280,11 +294,21 @@
     const batchPageLabel = document.getElementById('batchPageLabel');
 
     let selectedFiles = [];
+    let selectedEntries = []; // [{ file, chapter, name }]
     let originalUrls = [];
     let batchResults = [];
     let currentIdx = 0;
     let viewMode = 'result';
     let providersMap = {};
+    let currentProviderId = '';
+    const draftKeys = {};
+    const draftModels = {};
+    const draftUrls = {};
+
+    const MAX_FILE_BYTES = 25 * 1024 * 1024;
+    const MAX_IMG_W = 8192;
+    const MAX_IMG_H = 16384;
+    const MAX_IMG_PIXELS = 40000000;
 
     function getServerApiKey() {
       return sessionStorage.getItem('komaweave_api_key') || '';
@@ -395,43 +419,74 @@
     }
 
     function onProviderChange() {
-      const prov = providersMap[providerSelect.value];
+      if (currentProviderId && providersMap[currentProviderId]?.requires_key) {
+        draftKeys[currentProviderId] = apiKeyInput.value;
+        draftModels[currentProviderId] = manualModelInput.value || modelSelect.value || '';
+        draftUrls[currentProviderId] = baseUrlInput.value;
+      }
+      const pid = providerSelect.value;
+      currentProviderId = pid;
+      const prov = providersMap[pid];
       if (!prov || !prov.requires_key) {
         aiConfigBox.hidden = true;
         return;
       }
       aiConfigBox.hidden = false;
       customUrlWrap.hidden = !prov.supports_custom_url;
-      baseUrlInput.value = prov.base_url || '';
-      apiKeyInput.value = '';
-      keyStatus.textContent = prov.has_key ? `(Saved: ${prov.masked_key})` : '(Not saved)';
+      baseUrlInput.value = draftUrls[pid] !== undefined ? draftUrls[pid] : (prov.base_url || '');
+      apiKeyInput.value = draftKeys[pid] || '';
+      apiKeyInput.placeholder = prov.has_key
+        ? `Saved (${prov.masked_key}) — leave blank to keep`
+        : 'Enter API key...';
+      keyStatus.textContent = prov.has_key ? `✓ Saved (${prov.masked_key})` : '(Not saved)';
+      keyStatus.style.color = prov.has_key ? '#16a34a' : '#64748b';
       clearKeyBtn.hidden = !prov.has_key;
+      const savedModel = draftModels[pid] !== undefined ? draftModels[pid] : (prov.selected_model || '');
       manualModelInput.value = '';
-      populateModelSelect(prov.selected_model ? [prov.selected_model] : [], prov.selected_model || '');
-      if (prov.has_key) fetchModels(true);
+      populateModelSelect(savedModel ? [savedModel] : [], savedModel);
+      if (prov.has_key || apiKeyInput.value.trim()) fetchModels(true);
     }
 
     providerSelect.addEventListener('change', onProviderChange);
     refreshModelsBtn.addEventListener('click', () => fetchModels(false));
 
-    saveKeyBtn.addEventListener('click', async () => {
+    async function persistProviderConfig(silent = false) {
       const pid = providerSelect.value;
+      const prov = providersMap[pid];
+      if (!prov || !prov.requires_key) return true;
+      const typedKey = apiKeyInput.value.trim();
+      const chosenModel = manualModelInput.value.trim() || modelSelect.value || null;
       const res = await apiFetch(`/api/providers/${pid}/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          api_key: apiKeyInput.value.trim() || null,
+          api_key: typedKey || null,
           base_url: baseUrlInput.value.trim() || null,
-          selected_model: manualModelInput.value.trim() || modelSelect.value || null,
+          selected_model: chosenModel,
         }),
       });
       const data = await res.json();
-      if (!res.ok) return alert(data.detail || 'Failed to save');
+      if (!res.ok) {
+        if (!silent) alert(data.detail || 'Failed to save');
+        return false;
+      }
       providersMap[pid] = data.provider;
+      draftKeys[pid] = '';
+      draftModels[pid] = data.provider.selected_model || '';
       apiKeyInput.value = '';
-      keyStatus.textContent = data.provider.has_key ? `(Saved: ${data.provider.masked_key})` : '(Not saved)';
+      apiKeyInput.placeholder = data.provider.has_key
+        ? `Saved (${data.provider.masked_key}) — leave blank to keep`
+        : 'Enter API key...';
+      keyStatus.textContent = data.provider.has_key ? `✓ Saved (${data.provider.masked_key})` : '(Not saved)';
+      keyStatus.style.color = data.provider.has_key ? '#16a34a' : '#64748b';
       clearKeyBtn.hidden = !data.provider.has_key;
-      fetchModels(true);
+      return true;
+    }
+
+    saveKeyBtn.addEventListener('click', async () => {
+      if (await persistProviderConfig(false)) {
+        fetchModels(true);
+      }
     });
 
     clearKeyBtn.addEventListener('click', async () => {
@@ -440,42 +495,162 @@
       const data = await res.json();
       if (res.ok) {
         providersMap[pid] = data.provider;
+        draftKeys[pid] = '';
+        apiKeyInput.value = '';
+        apiKeyInput.placeholder = 'Enter API key...';
         keyStatus.textContent = '(Not saved)';
+        keyStatus.style.color = '#64748b';
         clearKeyBtn.hidden = true;
       }
     });
 
-    function setFiles(fileList) {
-      const files = Array.from(fileList || []).filter((f) => f.type.startsWith('image/'));
-      if (!files.length) return;
-      selectedFiles = files;
+    function naturalSortKey(s) {
+      return s.split(/(\d+)/).map((p) => (/^\d+$/.test(p) ? Number(p) : p.toLowerCase()));
+    }
+    function naturalCompare(a, b) {
+      const ka = naturalSortKey(a), kb = naturalSortKey(b);
+      for (let i = 0; i < Math.max(ka.length, kb.length); i++) {
+        if (ka[i] === undefined) return -1;
+        if (kb[i] === undefined) return 1;
+        if (ka[i] !== kb[i]) return ka[i] < kb[i] ? -1 : 1;
+      }
+      return 0;
+    }
+
+    async function validateImageFile(file) {
+      if (file.size > MAX_FILE_BYTES) {
+        throw new Error(`'${file.name}' exceeds 25 MB limit (${(file.size / 1048576).toFixed(1)} MB).`);
+      }
+      const url = URL.createObjectURL(file);
+      try {
+        const dims = await new Promise((resolve, reject) => {
+          const im = new Image();
+          im.onload = () => resolve({ w: im.naturalWidth, h: im.naturalHeight });
+          im.onerror = () => reject(new Error(`Invalid or corrupted image: ${file.name}`));
+          im.src = url;
+        });
+        if (dims.w > MAX_IMG_W || dims.h > MAX_IMG_H || dims.w * dims.h > MAX_IMG_PIXELS) {
+          throw new Error(`'${file.name}' (${dims.w}x${dims.h}) exceeds max allowed dimensions (${MAX_IMG_W}x${MAX_IMG_H}, 40 MP).`);
+        }
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+
+    function extractChapterAndName(file, relPathOverride = '') {
+      const rel = relPathOverride || file.webkitRelativePath || file.name;
+      const parts = rel.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        return { chapter: parts.slice(0, -1).join('/'), name: parts[parts.length - 1] };
+      }
+      return { chapter: '', name: file.name };
+    }
+
+    async function queueEntries(rawEntries, append = false) {
+      const valid = [];
+      for (const item of rawEntries) {
+        if (!item.file.type.startsWith('image/') && !/\.(png|jpe?g|webp)$/i.test(item.file.name)) continue;
+        try {
+          await validateImageFile(item.file);
+          valid.push(item);
+        } catch (err) {
+          alert(err.message);
+          return;
+        }
+      }
+      if (!valid.length) return;
+      valid.sort((a, b) => naturalCompare(`${a.chapter}/${a.name}`, `${b.chapter}/${b.name}`));
+      selectedEntries = append ? [...selectedEntries, ...valid] : valid;
+      selectedFiles = selectedEntries.map((e) => e.file);
       originalUrls.forEach((u) => URL.revokeObjectURL(u));
-      originalUrls = files.map((f) => URL.createObjectURL(f));
+      originalUrls = selectedFiles.map((f) => URL.createObjectURL(f));
       batchResults = [];
       currentIdx = 0;
       batchNav.hidden = true;
       downloadBtn.hidden = true;
       translateBtn.disabled = false;
-      consolidatedWrap.hidden = files.length <= 1;
-      if (files.length === 1) {
-        fileNameEl.textContent = `${files[0].name} (${(files[0].size / 1024).toFixed(1)} KB)`;
+      clearQueueBtn.hidden = false;
+      consolidatedWrap.hidden = selectedFiles.length <= 1;
+
+      const chapters = [...new Set(selectedEntries.map((e) => e.chapter || 'Single Batch'))];
+      if (selectedFiles.length === 1) {
+        fileNameEl.textContent = `${selectedFiles[0].name} (${(selectedFiles[0].size / 1024).toFixed(1)} KB)`;
         translateBtn.textContent = 'Translate';
       } else {
-        const totalKb = files.reduce((s, f) => s + f.size, 0) / 1024;
-        fileNameEl.textContent = `${files.length} pages (${totalKb.toFixed(0)} KB)`;
-        translateBtn.textContent = `Translate Batch (${files.length})`;
+        const totalMb = (selectedFiles.reduce((s, f) => s + f.size, 0) / 1048576).toFixed(1);
+        const chLabel = chapters.length > 1 ? `${chapters.length} chapters · ` : '';
+        fileNameEl.textContent = `${chLabel}${selectedFiles.length} pages (${totalMb} MB)`;
+        translateBtn.textContent = chapters.length > 1
+          ? `Translate ${chapters.length} Chapters (${selectedFiles.length} pages)`
+          : `Translate Batch (${selectedFiles.length})`;
       }
       renderView();
     }
 
+    async function setFiles(fileList, append = false) {
+      const entries = Array.from(fileList || []).map((f) => ({
+        file: f,
+        ...extractChapterAndName(f),
+      }));
+      await queueEntries(entries, append);
+    }
+
+    async function traverseEntry(entry, prefix = '') {
+      if (entry.isFile) {
+        const file = await new Promise((res, rej) => entry.file(res, rej));
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        return [{ file, ...extractChapterAndName(file, rel) }];
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const children = [];
+        while (true) {
+          const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+          if (!batch.length) break;
+          children.push(...batch);
+        }
+        const subPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const nested = await Promise.all(children.map((c) => traverseEntry(c, subPrefix)));
+        return nested.flat();
+      }
+      return [];
+    }
+
+    pickImagesBtn.addEventListener('click', () => fileInput.click());
+    pickFolderBtn.addEventListener('click', () => folderInput.click());
+    addFolderBtn.addEventListener('click', () => addFolderInput.click());
+    clearQueueBtn.addEventListener('click', () => {
+      selectedEntries = [];
+      selectedFiles = [];
+      batchResults = [];
+      originalUrls.forEach((u) => URL.revokeObjectURL(u));
+      originalUrls = [];
+      fileNameEl.textContent = '';
+      clearQueueBtn.hidden = true;
+      downloadBtn.hidden = true;
+      batchNav.hidden = true;
+      translateBtn.disabled = true;
+      translateBtn.textContent = 'Translate';
+      canvasWrap.innerHTML = '<span class="placeholder">Upload manga or manhwa pages to begin</span>';
+    });
+
     dropzone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', (e) => setFiles(e.target.files));
+    fileInput.addEventListener('change', (e) => { setFiles(e.target.files, false); e.target.value = ''; });
+    folderInput.addEventListener('change', (e) => { setFiles(e.target.files, false); e.target.value = ''; });
+    addFolderInput.addEventListener('change', (e) => { setFiles(e.target.files, true); e.target.value = ''; });
     dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
-    dropzone.addEventListener('drop', (e) => {
+    dropzone.addEventListener('drop', async (e) => {
       e.preventDefault();
       dropzone.classList.remove('dragover');
-      setFiles(e.dataTransfer.files);
+      const items = Array.from(e.dataTransfer.items || []);
+      const entries = items.map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+      if (entries.length && entries.some((en) => en.isDirectory)) {
+        const all = (await Promise.all(entries.map((en) => traverseEntry(en)))).flat();
+        await queueEntries(all, false);
+      } else {
+        await setFiles(e.dataTransfer.files, false);
+      }
     });
 
     function renderView() {
@@ -525,6 +700,68 @@
     document.getElementById('tabOriginal').onclick = (e) => switchTab('original', e.target);
     document.getElementById('tabSplit').onclick = (e) => switchTab('split', e.target);
 
+    function crc32(bytes) {
+      let c = 0xFFFFFFFF;
+      for (let i = 0; i < bytes.length; i++) {
+        c ^= bytes[i];
+        for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+      }
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    function buildZipBlob(entries) {
+      const enc = new TextEncoder();
+      const localParts = [];
+      const centralParts = [];
+      let offset = 0;
+      for (const { path, bytes } of entries) {
+        const nameBytes = enc.encode(path);
+        const crc = crc32(bytes);
+        const lh = new Uint8Array(30 + nameBytes.length);
+        const lv = new DataView(lh.buffer);
+        lv.setUint32(0, 0x04034b50, true);
+        lv.setUint16(4, 20, true);
+        lv.setUint16(8, 0, true);
+        lv.setUint32(14, crc, true);
+        lv.setUint32(18, bytes.length, true);
+        lv.setUint32(22, bytes.length, true);
+        lv.setUint16(26, nameBytes.length, true);
+        lh.set(nameBytes, 30);
+        localParts.push(lh, bytes);
+
+        const ch = new Uint8Array(46 + nameBytes.length);
+        const cv = new DataView(ch.buffer);
+        cv.setUint32(0, 0x02014b50, true);
+        cv.setUint16(4, 20, true);
+        cv.setUint16(6, 20, true);
+        cv.setUint32(16, crc, true);
+        cv.setUint32(20, bytes.length, true);
+        cv.setUint32(24, bytes.length, true);
+        cv.setUint16(28, nameBytes.length, true);
+        cv.setUint32(42, offset, true);
+        ch.set(nameBytes, 46);
+        centralParts.push(ch);
+        offset += lh.length + bytes.length;
+      }
+      const cdSize = centralParts.reduce((s, p) => s + p.length, 0);
+      const eocd = new Uint8Array(22);
+      const ev = new DataView(eocd.buffer);
+      ev.setUint32(0, 0x06054b50, true);
+      ev.setUint16(8, entries.length, true);
+      ev.setUint16(10, entries.length, true);
+      ev.setUint32(12, cdSize, true);
+      ev.setUint32(16, offset, true);
+      return new Blob([...localParts, ...centralParts, eocd], { type: 'application/zip' });
+    }
+
+    function dataUriToBytes(uri) {
+      const b64 = uri.split(',')[1];
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
     translateBtn.addEventListener('click', async () => {
       if (!selectedFiles.length) return;
       translateBtn.disabled = true;
@@ -532,22 +769,25 @@
       translateBtn.textContent = 'Processing...';
 
       const pid = providerSelect.value;
+      if (apiKeyInput.value.trim()) {
+        await persistProviderConfig(true);
+      }
       const chosenModel = manualModelInput.value.trim() || modelSelect.value || '';
-      const fd = new FormData();
-      fd.append('target_lang', targetLangEl.value);
-      fd.append('source_lang', sourceLangEl.value);
-      fd.append('provider', pid);
-      if (chosenModel) fd.append('model', chosenModel);
-      if (apiKeyInput.value.trim()) fd.append('api_key', apiKeyInput.value.trim());
-      if (baseUrlInput.value.trim()) fd.append('base_url', baseUrlInput.value.trim());
 
       try {
         if (selectedFiles.length === 1) {
+          const fd = new FormData();
+          fd.append('target_lang', targetLangEl.value);
+          fd.append('source_lang', sourceLangEl.value);
+          fd.append('provider', pid);
+          if (chosenModel) fd.append('model', chosenModel);
+          if (apiKeyInput.value.trim()) fd.append('api_key', apiKeyInput.value.trim());
+          if (baseUrlInput.value.trim()) fd.append('base_url', baseUrlInput.value.trim());
           fd.append('file', selectedFiles[0]);
           const res = await apiFetch('/api/translate', { method: 'POST', body: fd });
           const data = await res.json();
           if (!res.ok) throw new Error(data.detail || 'Translation failed');
-          batchResults = [data];
+          batchResults = [{ ...data, _outPath: selectedEntries[0].name.replace(/\.[^.]+$/, '.png') }];
           currentIdx = 0;
 
           document.getElementById('metricsSection').hidden = false;
@@ -558,38 +798,97 @@
           document.getElementById('mRender').textContent = `${data.timings_s.render.toFixed(2)}s`;
           document.getElementById('mRemoval').textContent = `${data.inpaint_stats.solid_filled} / ${data.inpaint_stats.aot_inpainted}`;
         } else {
-          selectedFiles.forEach((f) => fd.append('files', f));
-          fd.append('consolidated', consolidatedChk.checked ? 'true' : 'false');
-          const res = await apiFetch('/api/translate-batch', { method: 'POST', body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || 'Batch translation failed');
-          batchResults = data.results;
-          currentIdx = 0;
+          const groups = new Map();
+          for (const entry of selectedEntries) {
+            const key = entry.chapter || 'chapter';
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(entry);
+          }
+          const groupEntries = Array.from(groups.entries());
+          const allResults = [];
+          let sumTotal = 0, sumOcr = 0, sumTrans = 0, sumInpaint = 0, sumRender = 0;
 
-          const cs = data.chapter_timings_s;
+          for (let gIdx = 0; gIdx < groupEntries.length; gIdx++) {
+            const [chName, chItems] = groupEntries[gIdx];
+            if (groupEntries.length > 1) {
+              translateBtn.textContent = `Chapter ${gIdx + 1}/${groupEntries.length} (${chName})...`;
+            }
+            const fd = new FormData();
+            fd.append('target_lang', targetLangEl.value);
+            fd.append('source_lang', sourceLangEl.value);
+            fd.append('provider', pid);
+            if (chosenModel) fd.append('model', chosenModel);
+            if (apiKeyInput.value.trim()) fd.append('api_key', apiKeyInput.value.trim());
+            if (baseUrlInput.value.trim()) fd.append('base_url', baseUrlInput.value.trim());
+            fd.append('consolidated', consolidatedChk.checked ? 'true' : 'false');
+            chItems.forEach((it) => fd.append('files', it.file));
+
+            const res = await apiFetch('/api/translate-batch', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || `Chapter '${chName}' failed`);
+
+            data.results.forEach((r, i) => {
+              const item = chItems[i];
+              const baseName = item.name.replace(/\.[^.]+$/, '.jpg');
+              const outPath = item.chapter ? `${item.chapter}/${baseName}` : baseName;
+              allResults.push({ ...r, _outPath: outPath });
+            });
+            const cs = data.chapter_timings_s;
+            sumTotal += cs.total;
+            sumOcr += cs.ocr;
+            sumTrans += cs.translate;
+            sumInpaint += cs.inpaint;
+            sumRender += cs.render;
+          }
+
+          batchResults = allResults;
+          currentIdx = 0;
           document.getElementById('metricsSection').hidden = false;
-          document.getElementById('mTotal').textContent = `${cs.total.toFixed(2)}s`;
-          document.getElementById('mOcr').textContent = `${cs.ocr.toFixed(2)}s`;
-          document.getElementById('mTrans').textContent = `${cs.translate.toFixed(2)}s`;
-          document.getElementById('mInpaint').textContent = `${cs.inpaint.toFixed(2)}s`;
-          document.getElementById('mRender').textContent = `${cs.render.toFixed(2)}s`;
-          document.getElementById('mRemoval').textContent = `${data.image_count} pages`;
+          document.getElementById('mTotal').textContent = `${sumTotal.toFixed(2)}s`;
+          document.getElementById('mOcr').textContent = `${sumOcr.toFixed(2)}s`;
+          document.getElementById('mTrans').textContent = `${sumTrans.toFixed(2)}s`;
+          document.getElementById('mInpaint').textContent = `${sumInpaint.toFixed(2)}s`;
+          document.getElementById('mRender').textContent = `${sumRender.toFixed(2)}s`;
+          document.getElementById('mRemoval').textContent = `${allResults.length} pages (${groupEntries.length} ch)`;
         }
 
         switchTab('result', document.getElementById('tabResult'));
         downloadBtn.hidden = false;
-        downloadBtn.onclick = () => {
-          const a = document.createElement('a');
-          a.href = batchResults[currentIdx].image_base64;
-          a.download = `translated_${targetLangEl.value}_${selectedFiles[currentIdx].name.replace(/\.[^.]+$/, '')}.png`;
-          a.click();
-        };
+        if (batchResults.length === 1) {
+          downloadBtn.textContent = 'Download';
+          downloadBtn.onclick = () => {
+            const a = document.createElement('a');
+            a.href = batchResults[0].image_base64;
+            a.download = `translated_${targetLangEl.value}_${selectedEntries[0].name.replace(/\.[^.]+$/, '')}.png`;
+            a.click();
+          };
+        } else {
+          downloadBtn.textContent = `Download All (.zip)`;
+          downloadBtn.onclick = () => {
+            const zipEntries = batchResults.map((r) => ({
+              path: r._outPath,
+              bytes: dataUriToBytes(r.image_base64),
+            }));
+            const blob = buildZipBlob(zipEntries);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `komaweave_${targetLangEl.value}_${batchResults.length}pages.zip`;
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+          };
+        }
       } catch (err) {
         alert(err.message);
       } finally {
         translateBtn.disabled = false;
         translateBtn.removeAttribute('aria-busy');
-        translateBtn.textContent = selectedFiles.length > 1 ? `Translate Batch (${selectedFiles.length})` : 'Translate';
+        const chapters = [...new Set(selectedEntries.map((e) => e.chapter || 'Single Batch'))];
+        translateBtn.textContent = selectedFiles.length <= 1
+          ? 'Translate'
+          : (chapters.length > 1
+              ? `Translate ${chapters.length} Chapters (${selectedFiles.length} pages)`
+              : `Translate Batch (${selectedFiles.length})`);
       }
     });
 
