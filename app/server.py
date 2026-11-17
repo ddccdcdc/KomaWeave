@@ -35,6 +35,7 @@ from app.config import (
     MAX_IMAGE_PIXELS,
     MAX_IMAGE_WIDTH,
     MAX_UPLOAD_BYTES,
+    MAX_WORKING_SIDE,
     MODEL_DISCOVERY_RATE_LIMIT_PER_MINUTE,
     RATE_LIMIT_PER_MINUTE,
     REQUEST_TIMEOUT_SECONDS,
@@ -167,6 +168,21 @@ def _validate_and_decode_image(raw: bytes, filename: str) -> np.ndarray:
     img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise HTTPException(status_code=400, detail=f"Invalid or unsupported image file: {filename}")
+
+    # Gracefully downscale overly large single pages/spreads so they never freeze CPU/GPU memory
+    ih, iw = img_bgr.shape[:2]
+    is_tall_strip = ih > iw * 2.2
+    if not is_tall_strip and max(ih, iw) > MAX_WORKING_SIDE:
+        scale = MAX_WORKING_SIDE / float(max(ih, iw))
+        nw = max(64, int(round(iw * scale)))
+        nh = max(64, int(round(ih * scale)))
+        img_bgr = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    elif is_tall_strip and iw > MAX_WORKING_SIDE:
+        scale = MAX_WORKING_SIDE / float(iw)
+        nw = MAX_WORKING_SIDE
+        nh = max(64, int(round(ih * scale)))
+        img_bgr = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
     return img_bgr
 
 

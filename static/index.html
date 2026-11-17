@@ -306,9 +306,9 @@
     const draftUrls = {};
 
     const MAX_FILE_BYTES = 25 * 1024 * 1024;
-    const MAX_IMG_W = 8192;
-    const MAX_IMG_H = 16384;
-    const MAX_IMG_PIXELS = 40000000;
+    const MAX_IMG_W = 16384;
+    const MAX_IMG_H = 32768;
+    const MAX_IMG_PIXELS = 120000000;
 
     function getServerApiKey() {
       return sessionStorage.getItem('komaweave_api_key') || '';
