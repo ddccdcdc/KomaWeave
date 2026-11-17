@@ -404,8 +404,10 @@ class SmartInpainter:
             img_s = img_bgr
             mask_s = mask_u8
 
-        pad_h = (self.pad_multiple - (nh % self.pad_multiple)) % self.pad_multiple
-        pad_w = (self.pad_multiple - (nw % self.pad_multiple)) % self.pad_multiple
+        target_h = max(80, ((nh + self.pad_multiple - 1) // self.pad_multiple) * self.pad_multiple)
+        target_w = max(80, ((nw + self.pad_multiple - 1) // self.pad_multiple) * self.pad_multiple)
+        pad_h = target_h - nh
+        pad_w = target_w - nw
         if pad_h or pad_w:
             img_s = cv2.copyMakeBorder(img_s, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
             mask_s = cv2.copyMakeBorder(mask_s, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)

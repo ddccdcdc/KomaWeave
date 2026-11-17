@@ -42,7 +42,11 @@ def smart_slice_vertical(
     cur_y = 0
     while cur_y < h:
         if h - cur_y <= max_height:
-            slices.append((cur_y, h, image_bgr[cur_y:h]))
+            if slices and (h - cur_y) < max(256, min_height // 3):
+                prev_y0, _, _ = slices.pop()
+                slices.append((prev_y0, h, image_bgr[prev_y0:h]))
+            else:
+                slices.append((cur_y, h, image_bgr[cur_y:h]))
             break
 
         lo = cur_y + min_height
