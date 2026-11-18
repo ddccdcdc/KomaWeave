@@ -41,7 +41,7 @@ FONT_ARABIC_SFX = FONTS_DIR / "Arabic-SFX.ttf"
 FONT_FALLBACK = FONTS_DIR / "NotoSans-Bold.ttf"
 
 # OCR settings (general-purpose PP-OCRv6)
-OCR_DET_LIMIT_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "1088"))
+OCR_DET_LIMIT_SIDE = int(os.getenv("OCR_DET_LIMIT_SIDE", "1280"))
 OCR_DET_BOX_THRESH = float(os.getenv("OCR_DET_BOX_THRESH", "0.28"))
 OCR_DET_THRESH = float(os.getenv("OCR_DET_THRESH", "0.20"))
 OCR_DET_UNCLIP_RATIO = float(os.getenv("OCR_DET_UNCLIP_RATIO", "1.6"))

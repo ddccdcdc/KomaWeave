@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import importlib.util
 import os
 import platform
 import shutil
@@ -58,7 +59,7 @@ def _ensure_windows_vc_redist() -> None:
     if platform.system() != "Windows":
         return
     missing = False
-    for dll in ("vcruntime140_1.dll", "msvcp140.dll"):
+    for dll in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
         try:
             ctypes.WinDLL(dll)
         except OSError:
@@ -87,6 +88,42 @@ def _ensure_windows_vc_redist() -> None:
                 installer.unlink()
         except OSError:
             pass
+
+
+def ensure_runtime_env(required_modules: tuple[str, ...]) -> None:
+    """Auto-enter .venv and run setup_project.py if any required runtime dependency is missing."""
+    if os.getenv("KOMAWEAVE_NO_VENV_REEXEC") == "1":
+        return
+
+    vpy = _venv_python()
+    in_local_venv = Path(sys.prefix).resolve() == VENV_DIR.resolve()
+
+    if not in_local_venv and vpy.exists():
+        check_expr = "import importlib.util, sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in %r) else 1)" % (
+            list(required_modules),
+        )
+        chk = subprocess.run(
+            [str(vpy), "-c", check_expr],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if chk.returncode != 0:
+            print("[KomaWeave] Completing environment setup inside .venv ...")
+            subprocess.check_call([str(vpy), str(Path(__file__).resolve())])
+        raise SystemExit(subprocess.call([str(vpy), str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]))
+
+    if all(importlib.util.find_spec(m) is not None for m in required_modules):
+        return
+
+    if not in_local_venv:
+        print("[KomaWeave] Environment not configured yet; running setup_project.py --venv ...")
+        subprocess.check_call([sys.executable, str(Path(__file__).resolve()), "--venv"])
+        if vpy.exists():
+            raise SystemExit(subprocess.call([str(vpy), str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]))
+    else:
+        print("[KomaWeave] Installing missing dependencies into .venv ...")
+        subprocess.check_call([sys.executable, str(Path(__file__).resolve())])
 
 
 def _detect_accelerator(requested: str) -> str:

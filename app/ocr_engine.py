@@ -99,7 +99,6 @@ class GeneralOCREngine:
             self.det_engine = self._build_det_engine(use_cuda=False, fast_mode=False)
         self._fast_det_engine: RapidOCR | None = None
         self.rec_engine = self._build_rec_engine(fast_mode=False)
-        self._rec_pool: List[RapidOCR] = []
 
     @property
     def fast_det_engine(self) -> RapidOCR:
@@ -144,24 +143,29 @@ class GeneralOCREngine:
 
     @classmethod
     def _build_det_engine(cls, use_cuda: bool, fast_mode: bool = False) -> RapidOCR:
-        eng = RapidOCR(
-            params={
-                "EngineConfig.onnxruntime.use_cuda": use_cuda,
-                "EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search": "HEURISTIC",
-                "EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy": "kSameAsRequested",
-                "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": 3 * 1024 * 1024 * 1024,
-                "Global.use_det": True,
-                "Global.use_cls": False,
-                "Global.use_rec": fast_mode,
-                "Det.model_type": ModelType.TINY if fast_mode else ModelType.MEDIUM,
-                "Rec.model_type": ModelType.TINY if fast_mode else ModelType.SMALL,
-                "Det.limit_type": "max",
-                "Det.limit_side_len": 800 if fast_mode else 1280,
-                "Det.box_thresh": OCR_DET_BOX_THRESH,
-                "Det.thresh": OCR_DET_THRESH,
-                "Det.unclip_ratio": OCR_DET_UNCLIP_RATIO,
-            }
-        )
+        side = 800 if fast_mode else OCR_DET_LIMIT_SIDE
+        params = {
+            "EngineConfig.onnxruntime.use_cuda": use_cuda,
+            "Global.use_det": True,
+            "Global.use_cls": False,
+            "Global.use_rec": fast_mode,
+            "Det.model_type": ModelType.TINY if fast_mode else ModelType.MEDIUM,
+            "Rec.model_type": ModelType.TINY if fast_mode else ModelType.SMALL,
+            "Det.limit_type": "max",
+            "Det.limit_side_len": side,
+            "Det.box_thresh": OCR_DET_BOX_THRESH,
+            "Det.thresh": OCR_DET_THRESH,
+            "Det.unclip_ratio": OCR_DET_UNCLIP_RATIO,
+        }
+        if use_cuda:
+            params.update(
+                {
+                    "EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search": "HEURISTIC",
+                    "EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy": "kSameAsRequested",
+                    "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": 3 * 1024 * 1024 * 1024,
+                }
+            )
+        eng = RapidOCR(params=params)
         cls._ensure_det_td(eng)
         if fast_mode:
             cls._ensure_rec_tr(eng)
@@ -435,11 +439,17 @@ class GeneralOCREngine:
                 (max(32, int(round(w0 * s))), max(32, int(round(h0 * s)))),
                 interpolation=cv2.INTER_AREA,
             )
-        op = det_td.get_preprocess(max(img.shape[0], img.shape[1]))
+        try:
+            op = det_td.get_preprocess()
+        except TypeError:
+            op = det_td.get_preprocess(max(img.shape[0], img.shape[1]))
         arr = op(img)
         if arr is None:
             return None
         _, _, h, w = arr.shape
+        if h > target_side or w > target_side:
+            arr = arr[:, :, :target_side, :target_side]
+            h, w = arr.shape[2], arr.shape[3]
         if h == target_side and w == target_side:
             return arr, h, w
         pad_h = max(0, target_side - h)
@@ -470,7 +480,7 @@ class GeneralOCREngine:
             rec_eng = self.rec_engine
         det_td = self._ensure_det_td(det_eng)
         rec_tr = self._ensure_rec_tr(rec_eng)
-        target_side = 800 if (self._fast_det_engine is not None and det_eng is self._fast_det_engine) else 1280
+        target_side = 800 if (self._fast_det_engine is not None and det_eng is self._fast_det_engine) else OCR_DET_LIMIT_SIDE
         prep = self._prep_padded(det_td, image_bgr, target_side)
         if prep is None:
             return [], []
@@ -616,7 +626,7 @@ class GeneralOCREngine:
 
         use_tiny = (ocr_model == "tiny")
         det_eng = self.fast_det_engine if use_tiny else self.det_engine
-        target_side = 800 if use_tiny else 1280
+        target_side = 800 if use_tiny else OCR_DET_LIMIT_SIDE
         det_td = self._ensure_det_td(det_eng)
         rec_pool = self.ensure_fast_pool(workers=min(4, max(2, workers)), fast_mode=use_tiny)
 

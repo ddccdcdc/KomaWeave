@@ -4,64 +4,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import platform
 import secrets
-import subprocess
-import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-VENV_DIR = ROOT / ".venv"
+from setup_project import ensure_runtime_env
 
-
-def _venv_python() -> Path:
-    if platform.system() == "Windows":
-        return VENV_DIR / "Scripts" / "python.exe"
-    return VENV_DIR / "bin" / "python"
-
-
-def _bootstrap_venv() -> None:
-    """Automatically enter .venv (and run setup_project.py if dependencies are missing)."""
-    if os.getenv("KOMAWEAVE_NO_VENV_REEXEC") == "1":
-        return
-
-    vpy = _venv_python()
-    in_local_venv = Path(sys.prefix).resolve() == VENV_DIR.resolve()
-
-    if not in_local_venv and vpy.exists():
-        # Verify core package inside .venv; run setup if incomplete
-        chk = subprocess.run(
-            [str(vpy), "-c", "import uvicorn, fastapi, rapidocr, torch"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if chk.returncode != 0:
-            print("[KomaWeave] Completing environment setup inside .venv ...")
-            subprocess.check_call([str(vpy), str(ROOT / "setup_project.py")])
-        raise SystemExit(subprocess.call([str(vpy), str(Path(__file__).resolve()), *sys.argv[1:]]))
-
-    # Already inside a venv or system Python without .venv: check imports
-    try:
-        import fastapi  # noqa: F401
-        import rapidocr  # noqa: F401
-        import torch  # noqa: F401
-        import uvicorn  # noqa: F401
-        return
-    except ImportError:
-        pass
-
-    if not in_local_venv:
-        print("[KomaWeave] Environment not configured yet; running setup_project.py --venv ...")
-        subprocess.check_call([sys.executable, str(ROOT / "setup_project.py"), "--venv"])
-        if vpy.exists():
-            raise SystemExit(subprocess.call([str(vpy), str(Path(__file__).resolve()), *sys.argv[1:]]))
-    else:
-        print("[KomaWeave] Installing missing dependencies into .venv ...")
-        subprocess.check_call([sys.executable, str(ROOT / "setup_project.py")])
-
-
-_bootstrap_venv()
+ensure_runtime_env(("uvicorn", "fastapi", "cv2", "rapidocr", "torch"))
 
 import uvicorn  # noqa: E402
 
