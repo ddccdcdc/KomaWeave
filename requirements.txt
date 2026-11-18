@@ -8,5 +8,6 @@ pillow>=10.4.0
 rapidocr>=3.9.0
 safetensors>=0.4.5
 huggingface-hub>=0.25.0
+onnx>=1.16.0
 arabic-reshaper>=3.0.0
 python-bidi>=0.6.0

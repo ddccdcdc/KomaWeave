@@ -282,7 +282,8 @@ class SmartInpainter:
                         self._ort_input_name = self._ort_session.get_inputs()[0].name
                         # Free PyTorch weights when running via DirectML ONNX Runtime
                         return None
-                    except Exception:
+                    except Exception as exc:
+                        print(f"[SmartInpainter] DirectML init failed, falling back to CPU: {exc}")
                         self._use_ort_dml = False
                         self.device_label = "cpu"
                 self._model = model
@@ -492,7 +493,8 @@ class SmartInpainter:
                 ort_in = np.transpose(inp, (2, 0, 1))[None, ...].astype(np.float32)
                 ort_out = self._ort_session.run(None, {self._ort_input_name: ort_in})[0]
                 pred = np.transpose(np.clip(ort_out[0], -1.0, 1.0), (1, 2, 0))
-            except Exception:
+            except Exception as exc:
+                print(f"[SmartInpainter] DirectML inference failed, falling back to CPU: {exc}")
                 self._ort_session = None
                 self._use_ort_dml = False
                 self.device_label = "cpu"
