@@ -7,6 +7,8 @@ import base64
 import hmac
 import io
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -231,6 +233,38 @@ async def get_languages():
     return {"languages": LANGUAGES}
 
 
+_CACHED_DML_GPU_NAME: Optional[str] = None
+
+
+def _get_dml_gpu_name() -> str:
+    global _CACHED_DML_GPU_NAME
+    if _CACHED_DML_GPU_NAME is not None:
+        return _CACHED_DML_GPU_NAME
+    name = "DirectML GPU"
+    if sys.platform == "win32":
+        try:
+            ps = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic Display' } | Select-Object -First 1 -ExpandProperty Name)",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            found = ps.stdout.strip()
+            if found:
+                name = f"{found} (DirectML)"
+        except Exception:
+            pass
+    _CACHED_DML_GPU_NAME = name
+    return name
+
+
 @app.get("/api/health")
 async def health():
     mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
@@ -241,13 +275,16 @@ async def health():
     elif mps_avail:
         device_name = "Apple MPS"
     elif ocr_dml or (_pipeline is not None and _pipeline._inpainter is not None and _pipeline._inpainter.device_label == "dml"):
-        device_name = "DirectML GPU"
+        device_name = _get_dml_gpu_name()
     else:
         device_name = "CPU"
     aot_loaded = (
         _pipeline is not None
         and _pipeline._inpainter is not None
-        and _pipeline._inpainter._model is not None
+        and (
+            _pipeline._inpainter._model is not None
+            or _pipeline._inpainter._ort_session is not None
+        )
     )
     return {
         "status": "ready" if _pipeline is not None else "initializing",

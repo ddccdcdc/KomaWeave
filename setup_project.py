@@ -126,14 +126,29 @@ def ensure_runtime_env(required_modules: tuple[str, ...]) -> None:
         subprocess.check_call([sys.executable, str(Path(__file__).resolve())])
 
 
+def _find_nvidia_smi() -> str | None:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    if platform.system() == "Windows":
+        for candidate in (
+            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+        ):
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
 def _detect_accelerator(requested: str) -> str:
     if requested != "auto":
         return requested
     system = platform.system()
-    if system in {"Windows", "Linux"} and shutil.which("nvidia-smi"):
+    nvidia_smi = _find_nvidia_smi() if system in {"Windows", "Linux"} else None
+    if nvidia_smi:
         try:
             res = subprocess.run(
-                ["nvidia-smi", "-L"],
+                [nvidia_smi, "-L"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
@@ -155,7 +170,7 @@ def _detect_accelerator(requested: str) -> str:
                     "powershell",
                     "-NoProfile",
                     "-Command",
-                    "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ';'",
+                    "(Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name) $($_.AdapterCompatibility) $($_.PNPDeviceID)\" }) -join ';'",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -164,7 +179,14 @@ def _detect_accelerator(requested: str) -> str:
                 check=False,
             )
             gpus = ps.stdout.lower()
-            if any(k in gpus for k in ("amd", "radeon", "intel", "arc", "iris", "uhd")):
+            hw_keywords = (
+                "ven_10de", "nvidia", "geforce", "rtx", "gtx", "quadro", "tesla",
+                "ven_1002", "ven_1022", "amd", "radeon",
+                "ven_8086", "intel", "arc", "iris", "uhd", "hd graphics",
+                "qcom", "qualcomm", "adreno", "snapdragon",
+                "remote display", "paravirtual",
+            )
+            if any(k in gpus for k in hw_keywords):
                 return "dml"
         except Exception:
             pass
@@ -205,13 +227,6 @@ def install_dependencies(accel: str) -> None:
             check=False,
         )
         _pip_install(["torch>=2.5.0", "onnxruntime-directml>=1.20.0"])
-        # Optional DirectML PyTorch backend (best-effort; skips cleanly if wheel unavailable for Python version)
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "torch-directml"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
     else:
         _pip_install(["torch>=2.5.0", "onnxruntime>=1.20.0"])
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -229,6 +230,7 @@ class SmartInpainter:
 
     def __init__(self, device: str | None = None, lazy: bool = True) -> None:
         self.device_label = "cpu"
+        self._use_ort_dml = False
         if device is None:
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -246,29 +248,84 @@ class SmartInpainter:
                         self.device_label = "dml"
                 except Exception:
                     pass
+                if self.device_label == "cpu":
+                    try:
+                        import onnxruntime as ort
+
+                        if "DmlExecutionProvider" in ort.get_available_providers():
+                            self.device_label = "dml"
+                            self._use_ort_dml = True
+                    except Exception:
+                        pass
         else:
             self.device = device
             self.device_label = str(device)
         self.use_fp16 = self.device_label == "cuda"
         self._model_lock = threading.Lock()
         self._model: Optional[AOTGenerator] = None
+        self._ort_session: Any = None
+        self._ort_input_name: str = "input"
         self.pad_multiple: int = 8
         if not lazy:
             self.ensure_loaded()
 
-    def ensure_loaded(self) -> AOTGenerator:
-        if self._model is not None:
+    def ensure_loaded(self) -> Optional[AOTGenerator]:
+        if self._model is not None or self._ort_session is not None:
             return self._model
         with self._model_lock:
-            if self._model is None:
-                self._model, self.pad_multiple = self._load_aot_model()
+            if self._model is None and self._ort_session is None:
+                model, pad_mult, weights_path = self._load_aot_model()
+                self.pad_multiple = pad_mult
+                if self._use_ort_dml:
+                    try:
+                        self._ort_session = self._build_ort_dml_session(model, weights_path)
+                        self._ort_input_name = self._ort_session.get_inputs()[0].name
+                        # Free PyTorch weights when running via DirectML ONNX Runtime
+                        return None
+                    except Exception:
+                        self._use_ort_dml = False
+                        self.device_label = "cpu"
+                self._model = model
         return self._model
 
     @property
     def model(self) -> AOTGenerator:
-        return self.ensure_loaded()
+        res = self.ensure_loaded()
+        if res is None:
+            model, pad_mult, _ = self._load_aot_model()
+            self.pad_multiple = pad_mult
+            return model
+        return res
 
-    def _load_aot_model(self) -> Tuple[AOTGenerator, int]:
+    @staticmethod
+    def _build_ort_dml_session(model: AOTGenerator, weights_path: str):
+        import onnxruntime as ort
+
+        onnx_path = Path(weights_path).with_name("aot_inpainting_opset17.onnx")
+        if not onnx_path.exists() or onnx_path.stat().st_size < 100_000:
+            tmp_path = onnx_path.with_suffix(".onnx.tmp")
+            dummy = torch.zeros(1, 4, 128, 128, dtype=torch.float32)
+            torch.onnx.export(
+                model.cpu().eval(),
+                dummy,
+                str(tmp_path),
+                input_names=["input"],
+                output_names=["output"],
+                dynamic_axes={"input": {2: "h", 3: "w"}, "output": {2: "h", 3: "w"}},
+                opset_version=17,
+                dynamo=False,
+            )
+            tmp_path.replace(onnx_path)
+        so = ort.SessionOptions()
+        so.enable_mem_pattern = False
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        return ort.InferenceSession(
+            str(onnx_path),
+            sess_options=so,
+            providers=["DmlExecutionProvider", "CPUExecutionProvider"],
+        )
+
+    def _load_aot_model(self) -> Tuple[AOTGenerator, int, str]:
         cfg_path = hf_hub_download(AOT_REPO_ID, "config.json")
         weights_path = hf_hub_download(AOT_REPO_ID, "model.safetensors")
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -286,7 +343,7 @@ class SmartInpainter:
         model.eval().to(self.device)
         if self.use_fp16:
             model.half()
-        return model, int(cfg.get("pad_multiple", 8))
+        return model, int(cfg.get("pad_multiple", 8)), weights_path
 
     @staticmethod
     def _extract_region_mask(
@@ -429,11 +486,23 @@ class SmartInpainter:
         rgb_masked = rgb * (1.0 - m[..., None])
 
         inp = np.concatenate([m[..., None], rgb_masked], axis=2)  # (H, W, 4): mask + RGB
-        tensor = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        if self.use_fp16:
-            tensor = tensor.half()
-
-        pred = self.model(tensor)[0].float().clamp(-1.0, 1.0).cpu().permute(1, 2, 0).numpy()
+        self.ensure_loaded()
+        if self._ort_session is not None:
+            try:
+                ort_in = np.transpose(inp, (2, 0, 1))[None, ...].astype(np.float32)
+                ort_out = self._ort_session.run(None, {self._ort_input_name: ort_in})[0]
+                pred = np.transpose(np.clip(ort_out[0], -1.0, 1.0), (1, 2, 0))
+            except Exception:
+                self._ort_session = None
+                self._use_ort_dml = False
+                self.device_label = "cpu"
+                tensor = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0).to(self.device)
+                pred = self.model(tensor)[0].float().clamp(-1.0, 1.0).cpu().permute(1, 2, 0).numpy()
+        else:
+            tensor = torch.from_numpy(inp).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            if self.use_fp16:
+                tensor = tensor.half()
+            pred = self.model(tensor)[0].float().clamp(-1.0, 1.0).cpu().permute(1, 2, 0).numpy()
         pred_rgb = ((pred + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
         pred_bgr = cv2.cvtColor(pred_rgb[:nh, :nw], cv2.COLOR_RGB2BGR)
 

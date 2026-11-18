@@ -85,7 +85,9 @@ class MangaTranslationPipeline:
     @property
     def active_device(self) -> str:
         if self._inpainter is not None:
-            return self._inpainter.device
+            return self._inpainter.device_label
+        if self._ocr is not None and getattr(self._ocr, "use_dml", False):
+            return "dml"
         import torch
 
         if torch.cuda.is_available():
