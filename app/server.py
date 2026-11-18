@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import hmac
 import io
 import os
@@ -554,7 +555,7 @@ async def translate_batch(
             detail=f"Batch exceeds maximum allowed file count ({MAX_BATCH_FILES}).",
         )
 
-    imgs_bgr: List[np.ndarray] = []
+    raw_items: List[Tuple[str, bytes]] = []
     total_batch_bytes = 0
     for idx, f in enumerate(files):
         safe_name = Path(f.filename or f"page_{idx + 1}.jpg").name
@@ -565,33 +566,98 @@ async def translate_batch(
                 status_code=413,
                 detail=f"Batch aggregate payload exceeds maximum allowed size ({MAX_BATCH_TOTAL_BYTES // (1024 * 1024)} MB).",
             )
-        img = await asyncio.to_thread(_validate_and_decode_image, raw, safe_name)
-        imgs_bgr.append(img)
-        del raw
+        raw_items.append((safe_name, raw))
 
     render_opts = await _build_render_options(
         font_name, font_file, font_scale, text_color, outline_enabled
     )
 
+    def _encode_one(res) -> Optional[str]:
+        if mode == "ocr":
+            return None
+        return _encode_image(res.image_bgr, output_format, output_quality)
+
+    def _encode_chunk(chunk_results) -> List[Optional[str]]:
+        if mode == "ocr":
+            return [None] * len(chunk_results)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            return list(ex.map(_encode_one, chunk_results))
+
+    # Process chapters in memory-bounded chunks (8 pages at a time) so large folders
+    # never hold hundreds of uncompressed BGR arrays or float32 tensors in RAM at once.
+    CHAPTER_CHUNK_SIZE = 8
+    items = []
+    chapter_timings: Dict[str, float] = {
+        "ocr": 0.0,
+        "translate": 0.0,
+        "inpaint": 0.0,
+        "render": 0.0,
+        "total": 0.0,
+        "slices_processed": 0,
+    }
+
     try:
-        async with _gpu_semaphore:
-            results, chapter_timings = await asyncio.wait_for(
-                _pipeline.process_chapter(
-                    imgs_bgr,
-                    target_lang=target_lang,
-                    source_lang=source_lang,
-                    provider=provider,
-                    model=model,
-                    api_key=api_key,
-                    base_url=base_url,
-                    consolidated=consolidated,
-                    mode=mode,
-                    ocr_model=ocr_model,
-                    inpaint_mode=inpaint_mode,
-                    render_options=render_opts,
-                ),
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
+        for c_start in range(0, len(raw_items), CHAPTER_CHUNK_SIZE):
+            chunk_raw = raw_items[c_start : c_start + CHAPTER_CHUNK_SIZE]
+            imgs_bgr = [
+                await asyncio.to_thread(_validate_and_decode_image, raw, safe_name)
+                for safe_name, raw in chunk_raw
+            ]
+            # Release compressed bytes for this chunk immediately after decode
+            for idx_clear in range(c_start, min(c_start + CHAPTER_CHUNK_SIZE, len(raw_items))):
+                raw_items[idx_clear] = (raw_items[idx_clear][0], b"")
+
+            async with _gpu_semaphore:
+                chunk_results, chunk_timings = await asyncio.wait_for(
+                    _pipeline.process_chapter(
+                        imgs_bgr,
+                        target_lang=target_lang,
+                        source_lang=source_lang,
+                        provider=provider,
+                        model=model,
+                        api_key=api_key,
+                        base_url=base_url,
+                        consolidated=consolidated,
+                        mode=mode,
+                        ocr_model=ocr_model,
+                        inpaint_mode=inpaint_mode,
+                        render_options=render_opts,
+                    ),
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            del imgs_bgr
+
+            b64_list = await asyncio.to_thread(_encode_chunk, chunk_results)
+            for (safe_name, _), res, b64_img in zip(chunk_raw, chunk_results, b64_list):
+                blocks_meta = [
+                    {
+                        "id": b.id,
+                        "source_text": b.text,
+                        "translated_text": b.translated_text,
+                        "bbox": list(b.bbox),
+                        "is_vertical": b.is_vertical,
+                        "is_sfx": b.is_sfx,
+                        "angle_deg": round(b.angle_deg, 1),
+                        "confidence": round(b.confidence, 3),
+                    }
+                    for b in res.blocks
+                ]
+                items.append(
+                    {
+                        "filename": safe_name,
+                        "image_base64": b64_img,
+                        "width": int(res.image_bgr.shape[1]),
+                        "height": int(res.image_bgr.shape[0]),
+                        "timings_ms": res.timings_ms,
+                        "inpaint_stats": res.inpaint_stats,
+                        "block_count": len(blocks_meta),
+                        "blocks": blocks_meta,
+                    }
+                )
+            for k in ("ocr", "translate", "inpaint", "render", "total", "slices_processed"):
+                chapter_timings[k] += chunk_timings.get(k, 0)
+            del chunk_results, b64_list
+            gc.collect()
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Batch translation request timed out.")
     except ValueError as e:
@@ -599,46 +665,9 @@ async def translate_batch(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Batch translation failed: {type(e).__name__}: {e}")
 
-    def _encode_one(res) -> Optional[str]:
-        if mode == "ocr":
-            return None
-        return _encode_image(res.image_bgr, output_format, output_quality)
-
-    def _encode_all() -> List[Optional[str]]:
-        if mode == "ocr":
-            return [None] * len(results)
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            return list(ex.map(_encode_one, results))
-
-    b64_list = await asyncio.to_thread(_encode_all)
-
-    items = []
-    for f, res, b64_img in zip(files, results, b64_list):
-        blocks_meta = [
-            {
-                "id": b.id,
-                "source_text": b.text,
-                "translated_text": b.translated_text,
-                "bbox": list(b.bbox),
-                "is_vertical": b.is_vertical,
-                "is_sfx": b.is_sfx,
-                "angle_deg": round(b.angle_deg, 1),
-                "confidence": round(b.confidence, 3),
-            }
-            for b in res.blocks
-        ]
-        items.append(
-            {
-                "filename": Path(f.filename or f"page_{len(items) + 1}.jpg").name,
-                "image_base64": b64_img,
-                "width": int(res.image_bgr.shape[1]),
-                "height": int(res.image_bgr.shape[0]),
-                "timings_ms": res.timings_ms,
-                "inpaint_stats": res.inpaint_stats,
-                "block_count": len(blocks_meta),
-                "blocks": blocks_meta,
-            }
-        )
+    for k in ("ocr", "translate", "inpaint", "render", "total"):
+        chapter_timings[k] = round(chapter_timings[k], 1)
+    chapter_timings["per_image_avg"] = round(chapter_timings["total"] / max(1, len(items)), 1)
 
     return JSONResponse(
         {

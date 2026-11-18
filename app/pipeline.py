@@ -404,6 +404,8 @@ class MangaTranslationPipeline:
         (translated_flat, t_trans), (inpainted_list, t_inpaint) = await asyncio.gather(
             _translate_all(), asyncio.to_thread(_inpaint_sync)
         )
+        num_slices = len(slice_imgs)
+        slice_imgs.clear()
 
         for (slice_idx, blk_idx), tr_txt in zip(flat_map, translated_flat):
             ocr_outputs[slice_idx][0][blk_idx].translated_text = tr_txt
@@ -420,9 +422,11 @@ class MangaTranslationPipeline:
 
         def _render_all() -> List[np.ndarray]:
             with ThreadPoolExecutor(max_workers=8) as ex:
-                return list(ex.map(_render_one, range(len(slice_imgs))))
+                return list(ex.map(_render_one, range(num_slices)))
 
         rendered_slices = await asyncio.to_thread(_render_all)
+        inpainted_stats_only = [stats for _, stats in inpainted_list]
+        inpainted_list.clear()
         t_render = (time.perf_counter() - t2) * 1000.0
         total_ms = (time.perf_counter() - t_start) * 1000.0
 
@@ -436,7 +440,7 @@ class MangaTranslationPipeline:
             aot_sum = 0
             for si in range(s_start, s_end):
                 y_off = slice_y_offsets[si]
-                _, st = inpainted_list[si]
+                st = inpainted_stats_only[si]
                 solid_sum += st.get("solid_filled", 0)
                 aot_sum += st.get("aot_inpainted", 0)
                 for b in ocr_outputs[si][0]:
@@ -481,8 +485,8 @@ class MangaTranslationPipeline:
             del stitched_run
 
         final_results: List[PipelineResult] = [r for r in results if r is not None]
-        n_slices = len(slice_imgs)
-        del slice_imgs, inpainted_list, rendered_slices
+        n_slices = num_slices
+        del slice_imgs, inpainted_list, rendered_slices, inpainted_stats_only
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

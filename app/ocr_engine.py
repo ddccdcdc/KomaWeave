@@ -640,29 +640,42 @@ class GeneralOCREngine:
         det_td = self._ensure_det_td(det_eng)
         rec_pool = self.ensure_fast_pool(workers=min(4, max(2, workers)), fast_mode=use_tiny)
 
-        # 1. Parallel CPU preprocess + pad to fixed square tensor so CUDA never re-tunes shapes
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            pre_list = list(ex.map(lambda im: self._prep_padded(det_td, im, target_side), images_bgr))
-
-        # 2. Run GPU Det with bounded batch size (1 for 1280x1280 medium, 4 for 800x800 tiny) to keep VRAM < 1.5 GB
-        valid_idxs = [i for i, p in enumerate(pre_list) if p is not None]
+        # 1 & 2. Windowed CPU preprocess + GPU Det (frees 18.8 MiB float32 tensors immediately)
         det_preds: List[np.ndarray | None] = [None] * n
         step = 4 if use_tiny else 1
-        for start in range(0, len(valid_idxs), step):
-            chunk_idxs = valid_idxs[start : start + step]
-            batch_np = np.concatenate([pre_list[i][0] for i in chunk_idxs], axis=0)
-            out = det_td.session(batch_np)
-            for k, orig_i in enumerate(chunk_idxs):
-                _, ph, pw = pre_list[orig_i]
-                det_preds[orig_i] = out[k : k + 1, :, :ph, :pw]
+        prep_window = max(step, 4)
+        for w_start in range(0, n, prep_window):
+            w_end = min(n, w_start + prep_window)
+            with ThreadPoolExecutor(max_workers=min(4, w_end - w_start)) as ex:
+                pre_win = list(
+                    ex.map(lambda im: self._prep_padded(det_td, im, target_side), images_bgr[w_start:w_end])
+                )
+            valid_local = [k for k, p in enumerate(pre_win) if p is not None]
+            for s in range(0, len(valid_local), step):
+                chunk_k = valid_local[s : s + step]
+                batch_np = (
+                    pre_win[chunk_k[0]][0]
+                    if len(chunk_k) == 1
+                    else np.concatenate([pre_win[k][0] for k in chunk_k], axis=0)
+                )
+                out = det_td.session(batch_np)
+                del batch_np
+                for pos, k in enumerate(chunk_k):
+                    _, ph, pw = pre_win[k]
+                    det_preds[w_start + k] = out[pos : pos + 1, :, :ph, :pw].copy()
+                    pre_win[k] = None
+                del out
+            del pre_win
 
         # 3. Parallel CPU DBPostProcess + perspective crop
         def _post_and_crop(idx: int):
             pred = det_preds[idx]
+            det_preds[idx] = None
             if pred is None:
                 return [], []
             img = images_bgr[idx]
             boxes, _ = det_td.postprocess_op(pred, (img.shape[0], img.shape[1]))
+            del pred
             if boxes is None or len(boxes) == 0:
                 return [], []
             boxes = det_td.sorted_boxes(boxes)
@@ -671,14 +684,16 @@ class GeneralOCREngine:
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             post_results = list(ex.map(_post_and_crop, range(n)))
+        del det_preds
 
         # Flatten all crops for parallel Rec
         flat_crops: List[np.ndarray] = []
         page_ranges: List[Tuple[int, int]] = []
-        for boxes, crops in post_results:
+        for idx, (boxes, crops) in enumerate(post_results):
             s = len(flat_crops)
             flat_crops.extend(crops)
             page_ranges.append((s, len(flat_crops)))
+            post_results[idx] = (boxes, [])
 
         flat_txts: List[str] = [""] * len(flat_crops)
         flat_scores: List[float] = [0.0] * len(flat_crops)
