@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import io
 import math
+import struct
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -24,13 +26,12 @@ from app.config import (
 from app.ocr_engine import TextBlock
 
 _HAS_RAQM = features.check("raqm")
-if not _HAS_RAQM:
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-    except ImportError:
-        arabic_reshaper = None
-        get_display = None
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+except ImportError:
+    arabic_reshaper = None
+    get_display = None
 
 
 @dataclass
@@ -52,6 +53,56 @@ def _parse_hex_color(color_str: str) -> Optional[Tuple[int, int, int]]:
         return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
     except ValueError:
         return None
+
+
+_FONT_CMAP_CACHE: dict[str, set[int]] = {}
+
+
+def _read_ttf_cmap(data: bytes) -> set[int]:
+    """Parse TrueType/OpenType cmap subtables (format 4 & 12) to list supported codepoints."""
+    try:
+        num_tables = struct.unpack(">H", data[4:6])[0]
+        for i in range(num_tables):
+            off = 12 + i * 16
+            tag, _, tbl_off, tbl_len = struct.unpack(">4sIII", data[off : off + 16])
+            if tag == b"cmap":
+                tbl = data[tbl_off : tbl_off + tbl_len]
+                nsub = struct.unpack(">H", tbl[2:4])[0]
+                cps: set[int] = set()
+                for j in range(nsub):
+                    _, _, sub_off = struct.unpack(">HHI", tbl[4 + j * 8 : 12 + j * 8])
+                    fmt = struct.unpack(">H", tbl[sub_off : sub_off + 2])[0]
+                    if fmt == 4:
+                        seg_count = struct.unpack(">H", tbl[sub_off + 6 : sub_off + 8])[0] // 2
+                        end_codes = struct.unpack(
+                            f">{seg_count}H", tbl[sub_off + 14 : sub_off + 14 + 2 * seg_count]
+                        )
+                        start_codes = struct.unpack(
+                            f">{seg_count}H",
+                            tbl[sub_off + 16 + 2 * seg_count : sub_off + 16 + 4 * seg_count],
+                        )
+                        for s, e in zip(start_codes, end_codes):
+                            if s != 0xFFFF:
+                                cps.update(range(s, e + 1))
+                return cps
+    except Exception:
+        pass
+    return set()
+
+
+def _get_font_cmap(font_path: Path, font_bytes: Optional[bytes] = None) -> set[int]:
+    if font_bytes is not None:
+        key = "bytes:" + hashlib.sha256(font_bytes).hexdigest()[:16]
+        if key not in _FONT_CMAP_CACHE:
+            _FONT_CMAP_CACHE[key] = _read_ttf_cmap(font_bytes)
+        return _FONT_CMAP_CACHE[key]
+    key = str(font_path)
+    if key not in _FONT_CMAP_CACHE:
+        try:
+            _FONT_CMAP_CACHE[key] = _read_ttf_cmap(font_path.read_bytes())
+        except Exception:
+            _FONT_CMAP_CACHE[key] = set()
+    return _FONT_CMAP_CACHE[key]
 
 
 class MangaRenderer:
@@ -125,11 +176,18 @@ class MangaRenderer:
         return self._font_cache[key]
 
     @staticmethod
-    def _prepare_text(text: str, is_rtl: bool) -> str:
+    def _prepare_text(text: str, is_rtl: bool, font_cmap: Optional[set[int]] = None) -> str:
         if not is_rtl or _HAS_RAQM:
             return text
         if arabic_reshaper is not None and get_display is not None:
-            return get_display(arabic_reshaper.reshape(text))
+            shaped = get_display(arabic_reshaper.reshape(text))
+            if font_cmap:
+                # Replace missing isolated Presentation Forms-B glyphs (e.g. 0xFE8D) with base Unicode (e.g. U+0627)
+                shaped = "".join(
+                    ch if (ord(ch) in font_cmap or ch.isspace()) else unicodedata.normalize("NFKC", ch)
+                    for ch in shaped
+                )
+            return shaped
         return text
 
     @staticmethod
@@ -152,6 +210,7 @@ class MangaRenderer:
         font: ImageFont.FreeTypeFont,
         max_width: int,
         is_rtl: bool,
+        font_cmap: Optional[set[int]] = None,
     ) -> List[str]:
         has_cjk = any("\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" for ch in text)
         if has_cjk and len(text.split()) <= 2:
@@ -175,7 +234,7 @@ class MangaRenderer:
         current = ""
         for word in words:
             candidate = f"{current} {word}".strip() if current else word
-            disp = MangaRenderer._prepare_text(candidate, is_rtl)
+            disp = MangaRenderer._prepare_text(candidate, is_rtl, font_cmap)
             if MangaRenderer._text_width(draw, disp, font, is_rtl) <= max_width or not current:
                 current = candidate
             else:
@@ -196,6 +255,7 @@ class MangaRenderer:
         max_size: int = 44,
         min_size: int = 8,
         font_bytes: Optional[bytes] = None,
+        font_cmap: Optional[set[int]] = None,
     ) -> Tuple[ImageFont.FreeTypeFont, List[str], int, int]:
         """Find largest font size where wrapped text fits comfortably inside (box_w, box_h)."""
         pad_w = max(6, int(box_w * 0.88))
@@ -203,17 +263,17 @@ class MangaRenderer:
 
         lo, hi = min_size, max(min_size, min(max_size, int(min(box_w, box_h) * 0.72)))
         best_font = self._get_font(font_path, lo, font_bytes=font_bytes)
-        best_lines = self._wrap_text(draw, text, best_font, pad_w, is_rtl)
+        best_lines = self._wrap_text(draw, text, best_font, pad_w, is_rtl, font_cmap)
         best_line_h = int(lo * 1.25)
 
         while lo <= hi:
             mid = (lo + hi) // 2
             font = self._get_font(font_path, mid, font_bytes=font_bytes)
-            lines = self._wrap_text(draw, text, font, pad_w, is_rtl)
+            lines = self._wrap_text(draw, text, font, pad_w, is_rtl, font_cmap)
             line_h = int(mid * 1.25)
             total_h = line_h * len(lines)
             max_line_w = max(
-                self._text_width(draw, self._prepare_text(ln, is_rtl), font, is_rtl)
+                self._text_width(draw, self._prepare_text(ln, is_rtl, font_cmap), font, is_rtl)
                 for ln in lines
             )
             if total_h <= pad_h and max_line_w <= pad_w:
@@ -286,6 +346,7 @@ class MangaRenderer:
 
             font_path = opts.font_path if (opts.font_path and opts.font_path.exists()) else self._pick_font_path(target_lang, blk.is_sfx)
             font_bytes = opts.font_bytes
+            font_cmap = _get_font_cmap(font_path, font_bytes) if (is_rtl and not _HAS_RAQM) else None
 
             # Only rotate true full-height thin margin strips (e.g. copyright) or consistent slanted text
             tall_vertical = bw < 32 and bh > bw * 6.0 and len(txt) > 15
@@ -328,11 +389,12 @@ class MangaRenderer:
                     is_rtl,
                     max_size=max(10, int(max(24, blk.avg_font_size * 1.1) * opts.font_scale)),
                     font_bytes=font_bytes,
+                    font_cmap=font_cmap,
                 )
                 cur_y = (diag - total_h) // 2
                 stroke_w = max(2, font.size // 10) if needs_outline else 0
                 for ln in lines:
-                    disp = self._prepare_text(ln, is_rtl)
+                    disp = self._prepare_text(ln, is_rtl, font_cmap)
                     lw = self._text_width(ldraw, disp, font, is_rtl)
                     lx = (diag - lw) // 2
                     kwargs = {
@@ -359,11 +421,12 @@ class MangaRenderer:
                     is_rtl,
                     max_size=max(10, int(max(28, blk.avg_font_size * 1.15) * opts.font_scale)),
                     font_bytes=font_bytes,
+                    font_cmap=font_cmap,
                 )
                 cur_y = y0 + max(0, (bh - total_h) // 2)
                 stroke_w = max(2, font.size // 10) if needs_outline else 0
                 for ln in lines:
-                    disp = self._prepare_text(ln, is_rtl)
+                    disp = self._prepare_text(ln, is_rtl, font_cmap)
                     lw = self._text_width(draw, disp, font, is_rtl)
                     lx = x0 + max(0, (bw - lw) // 2)
                     kwargs = {

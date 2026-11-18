@@ -146,6 +146,28 @@ def _detect_accelerator(requested: str) -> str:
             pass
     if system == "Darwin" and platform.machine() == "arm64":
         return "mps"
+    if system == "Linux" and (Path("/dev/kfd").exists() or shutil.which("rocm-smi")):
+        return "rocm"
+    if system == "Windows":
+        try:
+            ps = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ';'",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=6,
+                check=False,
+            )
+            gpus = ps.stdout.lower()
+            if any(k in gpus for k in ("amd", "radeon", "intel", "arc", "iris", "uhd")):
+                return "dml"
+        except Exception:
+            pass
     return "cpu"
 
 
@@ -172,6 +194,24 @@ def install_dependencies(accel: str) -> None:
         if not has_cuda_torch:
             _pip_install(["torch>=2.5.0"], extra_index_url="https://download.pytorch.org/whl/cu124")
         _pip_install(["onnxruntime-gpu>=1.20.0,<1.24.0"])
+    elif accel == "rocm":
+        _pip_install(["torch>=2.5.0"], extra_index_url="https://download.pytorch.org/whl/rocm6.2")
+        _pip_install(["onnxruntime>=1.20.0"])
+    elif accel == "dml":
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        _pip_install(["torch>=2.5.0", "onnxruntime-directml>=1.20.0"])
+        # Optional DirectML PyTorch backend (best-effort; skips cleanly if wheel unavailable for Python version)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "torch-directml"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
     else:
         _pip_install(["torch>=2.5.0", "onnxruntime>=1.20.0"])
 
@@ -218,7 +258,7 @@ def precache_models() -> None:
         inpaint_mode="aot_only",
     )
     print(
-        f"Setup complete! (OCR CUDA={ocr.use_cuda}, Inpainter device={inp.device})\n"
+        f"Setup complete! (OCR CUDA={ocr.use_cuda}, OCR DML={ocr.use_dml}, Inpainter device={inp.device_label})\n"
         "Start the server with: python run.py"
     )
 
@@ -227,9 +267,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="One-command setup for KomaWeave.")
     parser.add_argument(
         "--device",
-        choices=["auto", "cuda", "mps", "cpu"],
+        choices=["auto", "cuda", "dml", "rocm", "mps", "cpu"],
         default="auto",
-        help="Target accelerator (default: auto-detect NVIDIA CUDA / Apple MPS / CPU).",
+        help="Target accelerator (default: auto-detect NVIDIA CUDA / Windows DirectML / Linux ROCm / Apple MPS / CPU).",
     )
     parser.add_argument(
         "--venv",

@@ -78,25 +78,34 @@ class TextBlock:
 class GeneralOCREngine:
     """High-speed, general-purpose multilingual OCR using RapidOCR PP-OCRv6."""
 
-    def __init__(self, use_cuda: bool | None = None) -> None:
-        if use_cuda is None:
-            try:
-                import onnxruntime as ort
+    def __init__(self, use_cuda: bool | None = None, use_dml: bool | None = None) -> None:
+        avail_providers: list[str] = []
+        try:
+            import onnxruntime as ort
 
-                use_cuda = torch.cuda.is_available() and (
-                    "CUDAExecutionProvider" in ort.get_available_providers()
-                )
-            except Exception:
-                use_cuda = False
+            avail_providers = list(ort.get_available_providers())
+        except Exception:
+            pass
+
+        if use_cuda is None:
+            use_cuda = torch.cuda.is_available() and ("CUDAExecutionProvider" in avail_providers)
         self.use_cuda = bool(use_cuda)
+
+        if use_dml is None:
+            use_dml = (not self.use_cuda) and ("DmlExecutionProvider" in avail_providers)
+        self.use_dml = bool(use_dml)
+
         self._lock = threading.Lock()
         try:
-            self.det_engine = self._build_det_engine(use_cuda=self.use_cuda, fast_mode=False)
+            self.det_engine = self._build_det_engine(
+                use_cuda=self.use_cuda, use_dml=self.use_dml, fast_mode=False
+            )
         except Exception:
-            if not self.use_cuda:
+            if not (self.use_cuda or self.use_dml):
                 raise
             self.use_cuda = False
-            self.det_engine = self._build_det_engine(use_cuda=False, fast_mode=False)
+            self.use_dml = False
+            self.det_engine = self._build_det_engine(use_cuda=False, use_dml=False, fast_mode=False)
         self._fast_det_engine: RapidOCR | None = None
         self.rec_engine = self._build_rec_engine(fast_mode=False)
 
@@ -106,7 +115,7 @@ class GeneralOCREngine:
             with self._lock:
                 if self._fast_det_engine is None:
                     self._fast_det_engine = self._build_det_engine(
-                        use_cuda=self.use_cuda, fast_mode=True
+                        use_cuda=self.use_cuda, use_dml=self.use_dml, fast_mode=True
                     )
         return self._fast_det_engine
 
@@ -142,10 +151,11 @@ class GeneralOCREngine:
         return eng.text_rec
 
     @classmethod
-    def _build_det_engine(cls, use_cuda: bool, fast_mode: bool = False) -> RapidOCR:
+    def _build_det_engine(cls, use_cuda: bool, use_dml: bool = False, fast_mode: bool = False) -> RapidOCR:
         side = 800 if fast_mode else OCR_DET_LIMIT_SIDE
         params = {
             "EngineConfig.onnxruntime.use_cuda": use_cuda,
+            "EngineConfig.onnxruntime.use_dml": use_dml,
             "Global.use_det": True,
             "Global.use_cls": False,
             "Global.use_rec": fast_mode,

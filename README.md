@@ -77,11 +77,11 @@ python run.py
 
 These commands automatically:
 1. Installs Microsoft Visual C++ Redistributable (`x64`) on Windows if missing, and creates a local `.venv` virtual environment (omit `--venv` to install into your active Python environment).
-2. Detects your hardware (**NVIDIA CUDA**, **Apple Silicon MPS**, or **CPU**) and installs the matching `torch` and `onnxruntime-gpu` / `onnxruntime` builds plus all dependencies in `requirements.txt`.
+2. Detects your hardware (**NVIDIA CUDA**, **Windows DirectML (AMD/Intel)**, **Linux AMD ROCm**, **Apple Silicon MPS**, or **CPU**) and installs the matching `torch` and `onnxruntime` builds plus all dependencies in `requirements.txt`.
 3. Downloads the required manga and Arabic/multilingual fonts into `fonts/` and pre-caches the `PP-OCRv6` and `mayocream/aot-inpainting` model weights.
 4. `python run.py` automatically enters `.venv` (and completes setup if skipped) and launches the server at **http://127.0.0.1:8000/**—no manual `activate` command required.
 
-> Override hardware detection with `--device cuda`, `--device mps`, or `--device cpu`.
+> Override hardware detection with `--device cuda`, `--device dml`, `--device rocm`, `--device mps`, or `--device cpu`.
 
 ---
 

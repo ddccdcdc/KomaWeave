@@ -228,16 +228,28 @@ class SmartInpainter:
     """Hybrid inpainter: fast solid-color fill for uniform bubbles + AOT-GAN for complex artwork."""
 
     def __init__(self, device: str | None = None, lazy: bool = True) -> None:
+        self.device_label = "cpu"
         if device is None:
             if torch.cuda.is_available():
                 self.device = "cuda"
+                self.device_label = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 self.device = "mps"
+                self.device_label = "mps"
             else:
                 self.device = "cpu"
+                try:
+                    import torch_directml  # type: ignore
+
+                    if torch_directml.is_available():
+                        self.device = torch_directml.device()
+                        self.device_label = "dml"
+                except Exception:
+                    pass
         else:
             self.device = device
-        self.use_fp16 = self.device == "cuda"
+            self.device_label = str(device)
+        self.use_fp16 = self.device_label == "cuda"
         self._model_lock = threading.Lock()
         self._model: Optional[AOTGenerator] = None
         self.pad_multiple: int = 8

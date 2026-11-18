@@ -234,13 +234,16 @@ async def get_languages():
 @app.get("/api/health")
 async def health():
     mps_avail = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ocr_loaded = _pipeline is not None and _pipeline._ocr is not None
+    ocr_dml = bool(_pipeline._ocr.use_dml) if ocr_loaded else False
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(0)
     elif mps_avail:
         device_name = "Apple MPS"
+    elif ocr_dml or (_pipeline is not None and _pipeline._inpainter is not None and _pipeline._inpainter.device_label == "dml"):
+        device_name = "DirectML GPU"
     else:
         device_name = "CPU"
-    ocr_loaded = _pipeline is not None and _pipeline._ocr is not None
     aot_loaded = (
         _pipeline is not None
         and _pipeline._inpainter is not None
@@ -254,6 +257,7 @@ async def health():
         "ocr_loaded": ocr_loaded,
         "aot_loaded": aot_loaded,
         "ocr_cuda": bool(_pipeline._ocr.use_cuda) if ocr_loaded else False,
+        "ocr_dml": ocr_dml,
         "device": device_name,
         "auth_required": bool(_get_configured_api_key()),
     }
