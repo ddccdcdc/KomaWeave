@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 import httpx
+
+_PURE_PUNCT_RE = re.compile(r"^[\s\d\.\,\!\?\-\—\–\…\~\*\(\)\[\]\{\}\:\;\'\"\/\\！？…・。、]+$")
 
 
 class FastGoogleTranslator:
@@ -14,7 +17,7 @@ class FastGoogleTranslator:
     PRIMARY_ENDPOINT = "https://clients5.google.com/translate_a/t"
     FALLBACK_ENDPOINT = "https://translate.googleapis.com/translate_a/single"
 
-    def __init__(self, timeout: float = 10.0, max_concurrency: int = 8) -> None:
+    def __init__(self, timeout: float = 10.0, max_concurrency: int = 12) -> None:
         self._timeout = timeout
         self._sem = asyncio.Semaphore(max_concurrency)
         self._cache: Dict[Tuple[str, str, str], str] = {}
@@ -106,34 +109,34 @@ class FastGoogleTranslator:
         if len(texts) == 1:
             return [await self.translate_one(texts[0], target_lang, source_lang)]
 
-        # Check cache first; batch only uncached items in a single HTTP request
-        results: List[str | None] = [None] * len(texts)
-        uncached_idx: List[int] = []
-        uncached_txt: List[str] = []
+        # Check cache & deduplicate uncached items + skip pure punctuation
+        results: List[Optional[str]] = [None] * len(texts)
+        unique_map: Dict[str, List[int]] = {}
         for i, t in enumerate(texts):
             clean = t.strip()
             key = (source_lang, target_lang, clean)
             if not clean:
                 results[i] = ""
+            elif _PURE_PUNCT_RE.match(clean):
+                results[i] = clean
             elif key in self._cache:
                 results[i] = self._cache[key]
             else:
-                uncached_idx.append(i)
-                uncached_txt.append(clean)
+                unique_map.setdefault(clean, []).append(i)
 
-        if not uncached_txt:
+        if not unique_map:
             return [r or "" for r in results]
 
-        # Chunk into <=12 items & <=1200 chars per request so GET URLs stay short & parallel
-        chunks: List[Tuple[List[int], List[str]]] = []
-        cur_idx: List[int] = []
+        # Chunk into <=16 unique items & <=1500 chars per request so GET URLs stay short & parallel
+        chunks: List[Tuple[List[List[int]], List[str]]] = []
+        cur_idx: List[List[int]] = []
         cur_txt: List[str] = []
         cur_len = 0
-        for idx, txt in zip(uncached_idx, uncached_txt):
-            if cur_txt and (len(cur_txt) >= 12 or cur_len + len(txt) > 1200):
+        for txt, idxs in unique_map.items():
+            if cur_txt and (len(cur_txt) >= 16 or cur_len + len(txt) > 1500):
                 chunks.append((cur_idx, cur_txt))
                 cur_idx, cur_txt, cur_len = [], [], 0
-            cur_idx.append(idx)
+            cur_idx.append(idxs)
             cur_txt.append(txt)
             cur_len += len(txt) + 8
         if cur_txt:
@@ -142,8 +145,8 @@ class FastGoogleTranslator:
         sep = "\n<|||>\n"
 
         async def _translate_chunk(
-            c_idx: List[int], c_txt: List[str]
-        ) -> List[Tuple[int, str, str]]:
+            c_idx: List[List[int]], c_txt: List[str]
+        ) -> List[Tuple[List[int], str, str]]:
             if len(c_txt) == 1:
                 dst = await self.translate_one(c_txt[0], target_lang, source_lang)
                 return [(c_idx[0], c_txt[0], dst)]
@@ -152,7 +155,6 @@ class FastGoogleTranslator:
             parts = [p.strip() for p in translated_joined.split("<|||>")]
             if len(parts) == len(c_txt) and all(parts):
                 return list(zip(c_idx, c_txt, parts))
-            # Split chunk in half recursively instead of blasting N single requests
             mid = len(c_txt) // 2
             left, right = await asyncio.gather(
                 _translate_chunk(c_idx[:mid], c_txt[:mid]),
@@ -164,9 +166,10 @@ class FastGoogleTranslator:
             *(_translate_chunk(ci, ct) for ci, ct in chunks)
         )
         for out in chunk_outputs:
-            for idx, src, dst in out:
+            for idxs, src, dst in out:
                 self._cache[(source_lang, target_lang, src)] = dst
-                results[idx] = dst
+                for idx in idxs:
+                    results[idx] = dst
         return [r or "" for r in results]
 
     async def close(self) -> None:

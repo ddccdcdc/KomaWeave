@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -29,6 +29,23 @@ class PipelineResult:
     timings_ms: Dict[str, float]
     inpaint_stats: Dict[str, int]
     device: str
+
+
+@dataclass
+class ChapterChunkState:
+    n_images: int
+    runs: List[Tuple[int, int]]
+    run_slice_ranges: List[Tuple[int, int]]
+    img_run_spans: List[Tuple[int, int]]
+    slice_y_offsets: List[int]
+    ocr_outputs: List[Tuple[List[TextBlock], List[np.ndarray]]]
+    flat_texts: List[str]
+    flat_map: List[Tuple[int, int]]
+    num_slices: int
+    t_start: float
+    t_ocr: float
+    t_inpaint: float = 0.0
+    inpainted_list: List[Tuple[np.ndarray, Dict[str, int]]] = field(default_factory=list)
 
 
 class MangaTranslationPipeline:
@@ -271,36 +288,19 @@ class MangaTranslationPipeline:
             device=self.active_device,
         )
 
-    async def process_chapter(
+    async def run_chunk_ocr(
         self,
         images_bgr: List[np.ndarray],
-        target_lang: str = "ar",
-        source_lang: str = "auto",
         ocr_workers: int = 6,
-        provider: str = "google_free",
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
         consolidated: bool = True,
         mode: str = "full",
         ocr_model: str = "auto",
-        inpaint_mode: str = "auto",
-        render_options: Optional[RenderOptions] = None,
-    ) -> Tuple[List[PipelineResult], Dict[str, float]]:
-        """High-speed parallel batch/chapter pipeline:
-        0) Smart gutter-aware slicing for ultra-long vertical strips (>2600px)
-        1) Batched GPU Det + parallel CPU Rec OCR across all slices
-        2) Chapter-wide consolidated AI/Google translation + GPU smart inpainting in parallel
-        3) Multi-threaded Pillow manga typesetting + seamless vertical stitching
-        """
+    ) -> Tuple[List[np.ndarray], ChapterChunkState]:
+        """Step 0 & 1: Seam-aware grouping, slicing, and batched OCR across a chunk."""
         if mode not in {"full", "ocr", "clean"}:
             raise ValueError(f"Unsupported pipeline mode: {mode}. Use 'full', 'ocr', or 'clean'.")
         t_start = time.perf_counter()
-        if not images_bgr:
-            return [], {"ocr": 0.0, "translate": 0.0, "inpaint": 0.0, "render": 0.0, "total": 0.0}
 
-        # 0. Group consecutive same-width images when consolidated=True ONLY when content
-        # actually crosses the boundary seam (webtoon strips), keeping normal pages intact.
         runs: List[Tuple[int, int]] = []
         if consolidated and len(images_bgr) > 1:
             r_start = 0
@@ -319,7 +319,7 @@ class MangaTranslationPipeline:
         slice_imgs: List[np.ndarray] = []
         slice_y_offsets: List[int] = []
         run_slice_ranges: List[Tuple[int, int]] = []
-        img_run_spans: List[Tuple[int, int]] = []  # (y0, y1) inside its run
+        img_run_spans: List[Tuple[int, int]] = []
 
         for r_start, r_end in runs:
             cur_y = 0
@@ -353,14 +353,12 @@ class MangaTranslationPipeline:
             run_slice_ranges.append((s_start, len(slice_imgs)))
             del run_canvas
 
-        # 1. Parallel Batched OCR across all slices
         t0 = time.perf_counter()
         ocr_outputs = await asyncio.to_thread(
             self.ocr.extract_batch, slice_imgs, ocr_workers, ocr_model
         )
         t_ocr = (time.perf_counter() - t0) * 1000.0
 
-        # Flatten all text blocks across the chapter for consolidated context-aware translation
         flat_texts: List[str] = []
         flat_map: List[Tuple[int, int]] = []
         for slice_idx, (blocks, _) in enumerate(ocr_outputs):
@@ -368,89 +366,144 @@ class MangaTranslationPipeline:
                 flat_texts.append(blk.text)
                 flat_map.append((slice_idx, blk_idx))
 
-        # 2. Run Translation & Smart Inpainting (respecting mode)
-        async def _translate_all() -> Tuple[List[str], float]:
-            ts = time.perf_counter()
-            if not flat_texts or mode != "full":
-                return [], 0.0
-            if consolidated:
-                tr = await self._translate_texts(
-                    flat_texts, target_lang, source_lang, provider, model, api_key, base_url
-                )
-                return tr, (time.perf_counter() - ts) * 1000.0
-            # Independent per-image translation in parallel
-            per_img_tasks = []
-            for s_start, s_end in run_slice_ranges:
-                img_texts = [b.text for si in range(s_start, s_end) for b in ocr_outputs[si][0]]
-                per_img_tasks.append(
-                    self._translate_texts(
-                        img_texts, target_lang, source_lang, provider, model, api_key, base_url
-                    )
-                )
-            per_img_results = await asyncio.gather(*per_img_tasks)
-            flat_tr = [t for sub in per_img_results for t in sub]
-            return flat_tr, (time.perf_counter() - ts) * 1000.0
+        state = ChapterChunkState(
+            n_images=len(images_bgr),
+            runs=runs,
+            run_slice_ranges=run_slice_ranges,
+            img_run_spans=img_run_spans,
+            slice_y_offsets=slice_y_offsets,
+            ocr_outputs=ocr_outputs,
+            flat_texts=flat_texts,
+            flat_map=flat_map,
+            num_slices=len(slice_imgs),
+            t_start=t_start,
+            t_ocr=t_ocr,
+        )
+        return slice_imgs, state
 
+    async def translate_chunk_state(
+        self,
+        state: ChapterChunkState,
+        target_lang: str,
+        source_lang: str,
+        provider: str,
+        model: Optional[str],
+        api_key: Optional[str],
+        base_url: Optional[str],
+        consolidated: bool,
+        mode: str,
+    ) -> Tuple[List[str], float]:
+        ts = time.perf_counter()
+        if not state.flat_texts or mode != "full":
+            return [], 0.0
+        if consolidated:
+            tr = await self._translate_texts(
+                state.flat_texts, target_lang, source_lang, provider, model, api_key, base_url
+            )
+            return tr, (time.perf_counter() - ts) * 1000.0
+        per_img_tasks = []
+        for s_start, s_end in state.run_slice_ranges:
+            img_texts = [b.text for si in range(s_start, s_end) for b in state.ocr_outputs[si][0]]
+            per_img_tasks.append(
+                self._translate_texts(
+                    img_texts, target_lang, source_lang, provider, model, api_key, base_url
+                )
+            )
+        per_img_results = await asyncio.gather(*per_img_tasks)
+        flat_tr = [t for sub in per_img_results for t in sub]
+        return flat_tr, (time.perf_counter() - ts) * 1000.0
+
+    async def run_chunk_inpaint(
+        self,
+        slice_imgs: List[np.ndarray],
+        state: ChapterChunkState,
+        mode: str = "full",
+        inpaint_mode: str = "auto",
+    ) -> None:
+        """Step 2b: Parallel CPU mask/solid-fill followed by serialized GPU AOT inpainting."""
         def _inpaint_sync() -> Tuple[List[Tuple[np.ndarray, Dict[str, int]]], float]:
             ts = time.perf_counter()
+            if mode == "ocr":
+                return [
+                    (img, {"solid_filled": 0, "aot_inpainted": 0})
+                    for img in slice_imgs
+                ], (time.perf_counter() - ts) * 1000.0
+
+            def _prep_one(item):
+                img, (_, polys) = item
+                if not polys:
+                    return img, None, {"solid_filled": 0, "aot_inpainted": 0}
+                return self.inpainter.prepare_inpaint(img, polys, inpaint_mode=inpaint_mode)
+
+            items = list(zip(slice_imgs, state.ocr_outputs))
+            if len(items) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(items))) as ex:
+                    prepped = list(ex.map(_prep_one, items))
+            else:
+                prepped = [_prep_one(items[0])]
+
             out: List[Tuple[np.ndarray, Dict[str, int]]] = []
-            for img, (_, polys) in zip(slice_imgs, ocr_outputs):
-                if not polys or mode == "ocr":
-                    out.append((img, {"solid_filled": 0, "aot_inpainted": 0}))
-                else:
-                    out.append(self.inpainter.remove_text(img, polys, inpaint_mode))
+            for cleaned, aot_mask, stats in prepped:
+                if aot_mask is not None:
+                    self.inpainter.finish_aot(cleaned, aot_mask)
+                out.append((cleaned, stats))
             return out, (time.perf_counter() - ts) * 1000.0
 
-        (translated_flat, t_trans), (inpainted_list, t_inpaint) = await asyncio.gather(
-            _translate_all(), asyncio.to_thread(_inpaint_sync)
-        )
-        num_slices = len(slice_imgs)
+        state.inpainted_list, state.t_inpaint = await asyncio.to_thread(_inpaint_sync)
         slice_imgs.clear()
 
-        for (slice_idx, blk_idx), tr_txt in zip(flat_map, translated_flat):
-            ocr_outputs[slice_idx][0][blk_idx].translated_text = tr_txt
+    async def finalize_chapter_chunk(
+        self,
+        state: ChapterChunkState,
+        translated_flat: List[str],
+        t_trans: float,
+        target_lang: str,
+        mode: str = "full",
+        render_options: Optional[RenderOptions] = None,
+    ) -> Tuple[List[PipelineResult], Dict[str, float]]:
+        """Step 3 & 4: Assign translations, multi-threaded typesetting, and stitch runs."""
+        for (slice_idx, blk_idx), tr_txt in zip(state.flat_map, translated_flat):
+            state.ocr_outputs[slice_idx][0][blk_idx].translated_text = tr_txt
 
-        # 3. Multi-threaded Rendering (skipped in ocr/clean modes)
         t2 = time.perf_counter()
 
         def _render_one(idx: int) -> np.ndarray:
-            cleaned, _ = inpainted_list[idx]
-            blocks = ocr_outputs[idx][0]
+            cleaned, _ = state.inpainted_list[idx]
+            blocks = state.ocr_outputs[idx][0]
             if not blocks or mode != "full":
                 return cleaned
             return self.renderer.render(cleaned, blocks, target_lang, render_options)
 
         def _render_all() -> List[np.ndarray]:
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                return list(ex.map(_render_one, range(num_slices)))
+            with ThreadPoolExecutor(max_workers=min(8, max(1, state.num_slices))) as ex:
+                return list(ex.map(_render_one, range(state.num_slices)))
 
         rendered_slices = await asyncio.to_thread(_render_all)
-        inpainted_stats_only = [stats for _, stats in inpainted_list]
-        inpainted_list.clear()
+        inpainted_stats_only = [stats for _, stats in state.inpainted_list]
+        state.inpainted_list.clear()
         t_render = (time.perf_counter() - t2) * 1000.0
-        total_ms = (time.perf_counter() - t_start) * 1000.0
+        total_ms = (time.perf_counter() - state.t_start) * 1000.0
 
-        # 4. Stitch slices back per run and split back to exact original image heights
-        results: List[Optional[PipelineResult]] = [None] * len(images_bgr)
-        n = len(images_bgr)
-        for (r_start, r_end), (s_start, s_end) in zip(runs, run_slice_ranges):
+        n = state.n_images
+        results: List[Optional[PipelineResult]] = [None] * n
+        for (r_start, r_end), (s_start, s_end) in zip(state.runs, state.run_slice_ranges):
             stitched_run = stitch_vertical(rendered_slices[s_start:s_end])
             run_blocks: List[TextBlock] = []
             solid_sum = 0
             aot_sum = 0
             for si in range(s_start, s_end):
-                y_off = slice_y_offsets[si]
+                y_off = state.slice_y_offsets[si]
                 st = inpainted_stats_only[si]
                 solid_sum += st.get("solid_filled", 0)
                 aot_sum += st.get("aot_inpainted", 0)
-                for b in ocr_outputs[si][0]:
+                for b in state.ocr_outputs[si][0]:
                     if y_off:
                         bx0, by0, bx1, by1 = b.bbox
                         b.bbox = (bx0, by0 + y_off, bx1, by1 + y_off)
                     run_blocks.append(b)
 
             for orig_idx in range(r_start, r_end):
-                ry0, ry1 = img_run_spans[orig_idx]
+                ry0, ry1 = state.img_run_spans[orig_idx]
                 out_img = np.ascontiguousarray(stitched_run[ry0:ry1])
                 img_blocks: List[TextBlock] = []
                 for b in run_blocks:
@@ -472,8 +525,8 @@ class MangaTranslationPipeline:
                     image_bgr=out_img,
                     blocks=img_blocks,
                     timings_ms={
-                        "ocr": round(t_ocr / n, 1),
-                        "inpaint": round(t_inpaint / n, 1),
+                        "ocr": round(state.t_ocr / n, 1),
+                        "inpaint": round(state.t_inpaint / n, 1),
                         "translate": round(t_trans / n, 1),
                         "render": round(t_render / n, 1),
                         "total": round(total_ms / n, 1),
@@ -485,21 +538,56 @@ class MangaTranslationPipeline:
             del stitched_run
 
         final_results: List[PipelineResult] = [r for r in results if r is not None]
-        n_slices = num_slices
-        del slice_imgs, inpainted_list, rendered_slices, inpainted_stats_only
+        del rendered_slices, inpainted_stats_only
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         chapter_timings = {
-            "ocr": round(t_ocr, 1),
+            "ocr": round(state.t_ocr, 1),
             "translate": round(t_trans, 1),
-            "inpaint": round(t_inpaint, 1),
+            "inpaint": round(state.t_inpaint, 1),
             "render": round(t_render, 1),
             "total": round(total_ms, 1),
             "per_image_avg": round(total_ms / n, 1),
-            "slices_processed": n_slices,
+            "slices_processed": state.num_slices,
         }
         return final_results, chapter_timings
+
+    async def process_chapter(
+        self,
+        images_bgr: List[np.ndarray],
+        target_lang: str = "ar",
+        source_lang: str = "auto",
+        ocr_workers: int = 6,
+        provider: str = "google_free",
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        consolidated: bool = True,
+        mode: str = "full",
+        ocr_model: str = "auto",
+        inpaint_mode: str = "auto",
+        render_options: Optional[RenderOptions] = None,
+    ) -> Tuple[List[PipelineResult], Dict[str, float]]:
+        """High-speed parallel batch/chapter pipeline."""
+        if not images_bgr:
+            return [], {"ocr": 0.0, "translate": 0.0, "inpaint": 0.0, "render": 0.0, "total": 0.0}
+        slice_imgs, state = await self.run_chunk_ocr(
+            images_bgr,
+            ocr_workers=ocr_workers,
+            consolidated=consolidated,
+            mode=mode,
+            ocr_model=ocr_model,
+        )
+        (translated_flat, t_trans), _ = await asyncio.gather(
+            self.translate_chunk_state(
+                state, target_lang, source_lang, provider, model, api_key, base_url, consolidated, mode
+            ),
+            self.run_chunk_inpaint(slice_imgs, state, mode=mode, inpaint_mode=inpaint_mode),
+        )
+        return await self.finalize_chapter_chunk(
+            state, translated_flat, t_trans, target_lang, mode=mode, render_options=render_options
+        )
 
     async def close(self) -> None:
         if self._translator is not None:

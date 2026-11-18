@@ -583,52 +583,74 @@ async def translate_batch(
         with ThreadPoolExecutor(max_workers=4) as ex:
             return list(ex.map(_encode_one, chunk_results))
 
-    # Process chapters in memory-bounded chunks (8 pages at a time) so large folders
-    # never hold hundreds of uncompressed BGR arrays or float32 tensors in RAM at once.
+    # 2-stage pipelined chapter execution in memory-bounded 8-page chunks:
+    # GPU OCR+Inpaint for chunk N+1 runs in parallel while chunk N awaits network translation & renders.
     CHAPTER_CHUNK_SIZE = 8
-    items = []
-    chapter_timings: Dict[str, float] = {
-        "ocr": 0.0,
-        "translate": 0.0,
-        "inpaint": 0.0,
-        "render": 0.0,
-        "total": 0.0,
-        "slices_processed": 0,
-    }
+    in_flight_sem = asyncio.Semaphore(2)
+    chunk_compute_lock = asyncio.Lock()
+    t_batch_start = time.perf_counter()
 
-    try:
-        for c_start in range(0, len(raw_items), CHAPTER_CHUNK_SIZE):
-            chunk_raw = raw_items[c_start : c_start + CHAPTER_CHUNK_SIZE]
+    async def _process_one_chunk(c_start: int):
+        async with in_flight_sem:
+            c_end = min(len(raw_items), c_start + CHAPTER_CHUNK_SIZE)
+            chunk_names = [raw_items[idx][0] for idx in range(c_start, c_end)]
             imgs_bgr = [
-                await asyncio.to_thread(_validate_and_decode_image, raw, safe_name)
-                for safe_name, raw in chunk_raw
+                await asyncio.to_thread(_validate_and_decode_image, raw_items[idx][1], raw_items[idx][0])
+                for idx in range(c_start, c_end)
             ]
-            # Release compressed bytes for this chunk immediately after decode
-            for idx_clear in range(c_start, min(c_start + CHAPTER_CHUNK_SIZE, len(raw_items))):
+            for idx_clear in range(c_start, c_end):
                 raw_items[idx_clear] = (raw_items[idx_clear][0], b"")
 
-            async with _gpu_semaphore:
-                chunk_results, chunk_timings = await asyncio.wait_for(
-                    _pipeline.process_chapter(
+            trans_task: Optional[asyncio.Task] = None
+            state = None
+            try:
+                async with _gpu_semaphore, chunk_compute_lock:
+                    slice_imgs, state = await _pipeline.run_chunk_ocr(
                         imgs_bgr,
-                        target_lang=target_lang,
-                        source_lang=source_lang,
-                        provider=provider,
-                        model=model,
-                        api_key=api_key,
-                        base_url=base_url,
                         consolidated=consolidated,
                         mode=mode,
                         ocr_model=ocr_model,
-                        inpaint_mode=inpaint_mode,
-                        render_options=render_opts,
-                    ),
-                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
+                    del imgs_bgr
+                    trans_task = asyncio.create_task(
+                        _pipeline.translate_chunk_state(
+                            state,
+                            target_lang=target_lang,
+                            source_lang=source_lang,
+                            provider=provider,
+                            model=model,
+                            api_key=api_key,
+                            base_url=base_url,
+                            consolidated=consolidated,
+                            mode=mode,
+                        )
+                    )
+                    await _pipeline.run_chunk_inpaint(
+                        slice_imgs, state, mode=mode, inpaint_mode=inpaint_mode
+                    )
+                    del slice_imgs
+
+                translated_flat, t_trans = await trans_task
+                chunk_results, chunk_timings = await _pipeline.finalize_chapter_chunk(
+                    state,
+                    translated_flat,
+                    t_trans,
+                    target_lang=target_lang,
+                    mode=mode,
+                    render_options=render_opts,
                 )
-            del imgs_bgr
+            except BaseException:
+                if trans_task is not None and not trans_task.done():
+                    trans_task.cancel()
+                    try:
+                        await trans_task
+                    except BaseException:
+                        pass
+                raise
 
             b64_list = await asyncio.to_thread(_encode_chunk, chunk_results)
-            for (safe_name, _), res, b64_img in zip(chunk_raw, chunk_results, b64_list):
+            chunk_items = []
+            for safe_name, res, b64_img in zip(chunk_names, chunk_results, b64_list):
                 blocks_meta = [
                     {
                         "id": b.id,
@@ -642,7 +664,7 @@ async def translate_batch(
                     }
                     for b in res.blocks
                 ]
-                items.append(
+                chunk_items.append(
                     {
                         "filename": safe_name,
                         "image_base64": b64_img,
@@ -654,10 +676,16 @@ async def translate_batch(
                         "blocks": blocks_meta,
                     }
                 )
-            for k in ("ocr", "translate", "inpaint", "render", "total", "slices_processed"):
-                chapter_timings[k] += chunk_timings.get(k, 0)
-            del chunk_results, b64_list
+            del chunk_results, b64_list, state
             gc.collect()
+            return chunk_items, chunk_timings
+
+    try:
+        chunk_starts = range(0, len(raw_items), CHAPTER_CHUNK_SIZE)
+        chunk_outputs = await asyncio.wait_for(
+            asyncio.gather(*(_process_one_chunk(cs) for cs in chunk_starts)),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Batch translation request timed out.")
     except ValueError as e:
@@ -665,9 +693,25 @@ async def translate_batch(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Batch translation failed: {type(e).__name__}: {e}")
 
-    for k in ("ocr", "translate", "inpaint", "render", "total"):
+    items = []
+    chapter_timings: Dict[str, float] = {
+        "ocr": 0.0,
+        "translate": 0.0,
+        "inpaint": 0.0,
+        "render": 0.0,
+        "total": 0.0,
+        "slices_processed": 0,
+    }
+    for chunk_items, chunk_timings in chunk_outputs:
+        items.extend(chunk_items)
+        for k in ("ocr", "translate", "inpaint", "render", "slices_processed"):
+            chapter_timings[k] += chunk_timings.get(k, 0)
+
+    wall_total_ms = (time.perf_counter() - t_batch_start) * 1000.0
+    for k in ("ocr", "translate", "inpaint", "render"):
         chapter_timings[k] = round(chapter_timings[k], 1)
-    chapter_timings["per_image_avg"] = round(chapter_timings["total"] / max(1, len(items)), 1)
+    chapter_timings["total"] = round(wall_total_ms, 1)
+    chapter_timings["per_image_avg"] = round(wall_total_ms / max(1, len(items)), 1)
 
     return JSONResponse(
         {

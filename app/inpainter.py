@@ -401,19 +401,13 @@ class SmartInpainter:
         is_uniform = std < UNIFORM_STD_THRESH and inlier_ratio >= UNIFORM_INLIER_RATIO
         return is_uniform, med.astype(np.uint8)
 
-    def remove_text(
+    def prepare_inpaint(
         self,
         image_bgr: np.ndarray,
         polygons: List[np.ndarray],
         inpaint_mode: str = "auto",
-    ) -> Tuple[np.ndarray, Dict[str, int]]:
-        """
-        Smartly remove text inside all polygons.
-        - inpaint_mode="auto": direct solid-color fill for uniform bubbles + mayocream/aot-inpainting for complex artwork
-        - inpaint_mode="solid_only": fast solid-color fill only (never loads AOT-GAN weights)
-        - inpaint_mode="aot_only": force AOT-GAN inpainting on all text regions
-        Returns (cleaned_bgr, stats_dict).
-        """
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, int]]:
+        """CPU-only mask extraction & uniform solid fills; returns (out_bgr, aot_mask_or_None, stats)."""
         if inpaint_mode not in {"auto", "solid_only", "aot_only"}:
             raise ValueError(f"Unsupported inpaint_mode: {inpaint_mode}")
         h, w = image_bgr.shape[:2]
@@ -451,18 +445,78 @@ class SmartInpainter:
                 d_mask = cv2.dilate(text_mask, np.ones((5, 5), np.uint8))
                 aot_mask[y0:y1, x0:x1] = np.maximum(aot_mask[y0:y1, x0:x1], d_mask)
 
-        if aot_count > 0 and np.any(aot_mask > 0):
-            inpainted = self._run_aot_inpaint(out, aot_mask)
-            alpha = (cv2.GaussianBlur(aot_mask, (5, 5), 0).astype(np.float32) / 255.0)[..., None]
-            alpha = np.where(aot_mask[..., None] > 0, np.maximum(alpha, 0.9), alpha)
-            out = (
-                inpainted.astype(np.float32) * alpha + out.astype(np.float32) * (1.0 - alpha)
-            ).clip(0, 255).astype(np.uint8)
+        final_mask = aot_mask if (aot_count > 0 and np.any(aot_mask > 0)) else None
+        return out, final_mask, {"solid_filled": solid_count, "aot_inpainted": aot_count}
 
-        return out, {"solid_filled": solid_count, "aot_inpainted": aot_count}
+    def finish_aot(self, out: np.ndarray, aot_mask: np.ndarray) -> np.ndarray:
+        """GPU/DML AOT-GAN inpainting + feathered composite inside tight ROI."""
+        h, w = out.shape[:2]
+        rx0, ry0, rx1, ry1 = self._compute_aot_roi(w, h, aot_mask)
+        out_roi = out[ry0:ry1, rx0:rx1]
+        mask_roi = aot_mask[ry0:ry1, rx0:rx1]
+        inpainted_roi = self._run_aot_inpaint_core(out_roi, mask_roi)
+        alpha = (cv2.GaussianBlur(mask_roi, (5, 5), 0).astype(np.float32) / 255.0)[..., None]
+        alpha = np.where(mask_roi[..., None] > 0, np.maximum(alpha, 0.9), alpha)
+        out[ry0:ry1, rx0:rx1] = (
+            inpainted_roi.astype(np.float32) * alpha + out_roi.astype(np.float32) * (1.0 - alpha)
+        ).clip(0, 255).astype(np.uint8)
+        return out
+
+    def remove_text(
+        self,
+        image_bgr: np.ndarray,
+        polygons: List[np.ndarray],
+        inpaint_mode: str = "auto",
+    ) -> Tuple[np.ndarray, Dict[str, int]]:
+        """
+        Smartly remove text inside all polygons.
+        - inpaint_mode="auto": direct solid-color fill for uniform bubbles + mayocream/aot-inpainting for complex artwork
+        - inpaint_mode="solid_only": fast solid-color fill only (never loads AOT-GAN weights)
+        - inpaint_mode="aot_only": force AOT-GAN inpainting on all text regions
+        Returns (cleaned_bgr, stats_dict).
+        """
+        out, aot_mask, stats = self.prepare_inpaint(image_bgr, polygons, inpaint_mode=inpaint_mode)
+        if aot_mask is not None:
+            self.finish_aot(out, aot_mask)
+        return out, stats
+
+    @staticmethod
+    def _compute_aot_roi(w: int, h: int, mask_u8: np.ndarray) -> Tuple[int, int, int, int]:
+        pts = cv2.findNonZero(mask_u8)
+        if pts is None:
+            return 0, 0, w, h
+        bx, by, bw, bh = cv2.boundingRect(pts)
+        margin = max(96, int(0.10 * max(h, w)))
+        rx0 = max(0, bx - margin)
+        ry0 = max(0, by - margin)
+        rx1 = min(w, bx + bw + margin)
+        ry1 = min(h, by + bh + margin)
+        min_side = min(256, w, h)
+        if (rx1 - rx0) < min_side:
+            cx = (rx0 + rx1) // 2
+            rx0 = max(0, min(w - min_side, cx - min_side // 2))
+            rx1 = min(w, rx0 + min_side)
+        if (ry1 - ry0) < min_side:
+            cy = (ry0 + ry1) // 2
+            ry0 = max(0, min(h - min_side, cy - min_side // 2))
+            ry1 = min(h, ry0 + min_side)
+        if (rx1 - rx0) * (ry1 - ry0) >= 0.65 * (w * h):
+            return 0, 0, w, h
+        return rx0, ry0, rx1, ry1
+
+    def _run_aot_inpaint(self, img_bgr: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
+        h, w = img_bgr.shape[:2]
+        rx0, ry0, rx1, ry1 = self._compute_aot_roi(w, h, mask_u8)
+        if (rx0, ry0, rx1, ry1) == (0, 0, w, h):
+            return self._run_aot_inpaint_core(img_bgr, mask_u8)
+        out = img_bgr.copy()
+        out[ry0:ry1, rx0:rx1] = self._run_aot_inpaint_core(
+            img_bgr[ry0:ry1, rx0:rx1], mask_u8[ry0:ry1, rx0:rx1]
+        )
+        return out
 
     @torch.inference_mode()
-    def _run_aot_inpaint(self, img_bgr: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
+    def _run_aot_inpaint_core(self, img_bgr: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
         h, w = img_bgr.shape[:2]
         scale = min(1.0, AOT_MAX_SIDE / max(h, w))
         if scale < 1.0:

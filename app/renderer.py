@@ -8,6 +8,7 @@ import math
 import struct
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -105,6 +106,22 @@ def _get_font_cmap(font_path: Path, font_bytes: Optional[bytes] = None) -> set[i
     return _FONT_CMAP_CACHE[key]
 
 
+_CMAP_BY_ID: dict[int, set[int]] = {}
+
+
+@lru_cache(maxsize=4096)
+def _shape_rtl_cached(text: str, cmap_id: int) -> str:
+    shaped = get_display(arabic_reshaper.reshape(text))
+    if cmap_id:
+        font_cmap = _CMAP_BY_ID.get(cmap_id)
+        if font_cmap:
+            shaped = "".join(
+                ch if (ord(ch) in font_cmap or ch.isspace()) else unicodedata.normalize("NFKC", ch)
+                for ch in shaped
+            )
+    return shaped
+
+
 class MangaRenderer:
     """Renders translated text onto cleaned manga pages with adaptive contrast & manga fonts."""
 
@@ -180,14 +197,11 @@ class MangaRenderer:
         if not is_rtl or _HAS_RAQM:
             return text
         if arabic_reshaper is not None and get_display is not None:
-            shaped = get_display(arabic_reshaper.reshape(text))
+            cmap_id = 0
             if font_cmap:
-                # Replace missing isolated Presentation Forms-B glyphs (e.g. 0xFE8D) with base Unicode (e.g. U+0627)
-                shaped = "".join(
-                    ch if (ord(ch) in font_cmap or ch.isspace()) else unicodedata.normalize("NFKC", ch)
-                    for ch in shaped
-                )
-            return shaped
+                cmap_id = id(font_cmap)
+                _CMAP_BY_ID[cmap_id] = font_cmap
+            return _shape_rtl_cached(text, cmap_id)
         return text
 
     @staticmethod
@@ -196,12 +210,21 @@ class MangaRenderer:
         disp: str,
         font: ImageFont.FreeTypeFont,
         is_rtl: bool,
+        w_cache: Optional[dict[Tuple[int, str], int]] = None,
     ) -> int:
+        if w_cache is not None:
+            ck = (id(font), disp)
+            cached = w_cache.get(ck)
+            if cached is not None:
+                return cached
         kwargs = {"font": font}
         if is_rtl and _HAS_RAQM:
             kwargs["direction"] = "rtl"
         tb = draw.textbbox((0, 0), disp, **kwargs)
-        return tb[2] - tb[0]
+        w = tb[2] - tb[0]
+        if w_cache is not None:
+            w_cache[(id(font), disp)] = w
+        return w
 
     @staticmethod
     def _wrap_text(
@@ -211,38 +234,55 @@ class MangaRenderer:
         max_width: int,
         is_rtl: bool,
         font_cmap: Optional[set[int]] = None,
-    ) -> List[str]:
+        w_cache: Optional[dict[Tuple[int, str], int]] = None,
+    ) -> Tuple[List[str], int]:
         has_cjk = any("\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff" for ch in text)
         if has_cjk and len(text.split()) <= 2:
             lines: List[str] = []
             current = ""
+            cur_w = 0
+            max_w = 0
             for ch in text:
                 candidate = current + ch
-                if MangaRenderer._text_width(draw, candidate, font, is_rtl) <= max_width or not current:
+                cw = MangaRenderer._text_width(draw, candidate, font, is_rtl, w_cache)
+                if cw <= max_width or not current:
                     current = candidate
+                    cur_w = cw
                 else:
                     lines.append(current)
+                    max_w = max(max_w, cur_w)
                     current = ch
+                    cur_w = MangaRenderer._text_width(draw, current, font, is_rtl, w_cache)
             if current:
                 lines.append(current)
-            return lines
+                max_w = max(max_w, cur_w)
+            return lines, max_w
 
         words = text.split()
         if not words:
-            return [text]
+            disp = MangaRenderer._prepare_text(text, is_rtl, font_cmap)
+            return [text], MangaRenderer._text_width(draw, disp, font, is_rtl, w_cache)
         lines: List[str] = []
         current = ""
+        cur_w = 0
+        max_w = 0
         for word in words:
             candidate = f"{current} {word}".strip() if current else word
             disp = MangaRenderer._prepare_text(candidate, is_rtl, font_cmap)
-            if MangaRenderer._text_width(draw, disp, font, is_rtl) <= max_width or not current:
+            cw = MangaRenderer._text_width(draw, disp, font, is_rtl, w_cache)
+            if cw <= max_width or not current:
                 current = candidate
+                cur_w = cw
             else:
                 lines.append(current)
+                max_w = max(max_w, cur_w)
                 current = word
+                w_disp = MangaRenderer._prepare_text(word, is_rtl, font_cmap)
+                cur_w = MangaRenderer._text_width(draw, w_disp, font, is_rtl, w_cache)
         if current:
             lines.append(current)
-        return lines
+            max_w = max(max_w, cur_w)
+        return lines, max_w
 
     def _fit_text(
         self,
@@ -260,22 +300,19 @@ class MangaRenderer:
         """Find largest font size where wrapped text fits comfortably inside (box_w, box_h)."""
         pad_w = max(6, int(box_w * 0.88))
         pad_h = max(6, int(box_h * 0.88))
+        w_cache: dict[Tuple[int, str], int] = {}
 
         lo, hi = min_size, max(min_size, min(max_size, int(min(box_w, box_h) * 0.72)))
         best_font = self._get_font(font_path, lo, font_bytes=font_bytes)
-        best_lines = self._wrap_text(draw, text, best_font, pad_w, is_rtl, font_cmap)
+        best_lines, _ = self._wrap_text(draw, text, best_font, pad_w, is_rtl, font_cmap, w_cache)
         best_line_h = int(lo * 1.25)
 
         while lo <= hi:
             mid = (lo + hi) // 2
             font = self._get_font(font_path, mid, font_bytes=font_bytes)
-            lines = self._wrap_text(draw, text, font, pad_w, is_rtl, font_cmap)
+            lines, max_line_w = self._wrap_text(draw, text, font, pad_w, is_rtl, font_cmap, w_cache)
             line_h = int(mid * 1.25)
             total_h = line_h * len(lines)
-            max_line_w = max(
-                self._text_width(draw, self._prepare_text(ln, is_rtl, font_cmap), font, is_rtl)
-                for ln in lines
-            )
             if total_h <= pad_h and max_line_w <= pad_w:
                 best_font = font
                 best_lines = lines
@@ -289,7 +326,9 @@ class MangaRenderer:
 
     @staticmethod
     def _analyze_background(
-        cleaned_bgr: np.ndarray, bbox: Tuple[int, int, int, int]
+        cleaned_bgr: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        gray_img: Optional[np.ndarray] = None,
     ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], bool]:
         """
         Inspect cleaned region luminance & variance.
@@ -298,19 +337,20 @@ class MangaRenderer:
         """
         h, w = cleaned_bgr.shape[:2]
         x0, y0, x1, y1 = max(0, bbox[0]), max(0, bbox[1]), min(w, bbox[2]), min(h, bbox[3])
-        roi = cleaned_bgr[y0:y1, x0:x1]
-        if roi.size == 0:
+        if x1 <= x0 or y1 <= y0:
             return (17, 17, 17), (255, 255, 255), False
 
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = (
+            gray_img[y0:y1, x0:x1]
+            if gray_img is not None
+            else cv2.cvtColor(cleaned_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        )
         lum = float(np.median(gray))
         std = float(np.std(gray))
         needs_outline = std > 18.0
 
         if lum < 128.0:
-            # Dark background -> white text (with dark outline if textured)
             return (255, 255, 255), (15, 15, 15), needs_outline
-        # Light background -> black text (with white outline if textured)
         return (17, 17, 17), (255, 255, 255), needs_outline
 
     def render(
@@ -323,7 +363,8 @@ class MangaRenderer:
         opts = options or RenderOptions()
         custom_rgb = _parse_hex_color(opts.text_color) if opts.text_color != "auto" else None
         is_rtl = target_lang in RTL_LANGUAGES
-        pil_img = Image.fromarray(cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
+        gray_full = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
+        pil_img = Image.fromarray(cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_img)
 
         for blk in blocks:
@@ -335,7 +376,7 @@ class MangaRenderer:
             bw, bh = max(24, x1 - x0), max(20, y1 - y0)
 
             fill_rgb, stroke_rgb, needs_outline = self._analyze_background(
-                cleaned_bgr, (x0, y0, x1, y1)
+                cleaned_bgr, (x0, y0, x1, y1), gray_img=gray_full
             )
             if custom_rgb is not None:
                 fill_rgb = custom_rgb
@@ -353,28 +394,30 @@ class MangaRenderer:
             ang_std = float(np.std([l.angle_deg for l in blk.lines])) if blk.lines else 0.0
             angled = (not blk.is_vertical) and (8.0 < abs(blk.angle_deg) < 72.0) and ang_std < 12.0
 
-            # Safely expand narrow bubbles ONLY within uniform bubble interior (scaled to page width)
+            # Safely expand narrow bubbles ONLY within uniform bubble interior (works on white, black & colored bubbles)
             narrow_thresh = max(96, int(pil_img.width * 0.18))
             max_expand = max(24, int(pil_img.width * 0.045))
             margin_pad = max(3, int(pil_img.width * 0.005))
             if (not tall_vertical) and bw < narrow_thresh and bh > bw * 1.35:
-                gray = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
-                cy = (y0 + y1) // 2
-                cx = (x0 + x1) // 2
-                center_val = int(gray[min(gray.shape[0] - 1, cy), min(gray.shape[1] - 1, cx)])
-                # Check if inside a uniform light or dark bubble
-                if center_val >= 235 or center_val <= 20:
+                cy = min(cleaned_bgr.shape[0] - 1, max(0, (y0 + y1) // 2))
+                cx = min(cleaned_bgr.shape[1] - 1, max(0, (x0 + x1) // 2))
+                patch_g = gray_full[max(0, cy - 3) : min(gray_full.shape[0], cy + 4), max(0, cx - 3) : min(gray_full.shape[1], cx + 4)]
+                if patch_g.size > 0 and float(np.std(patch_g)) < 15.0:
+                    center_bgr = cleaned_bgr[cy, cx].astype(np.int16)
                     lx_lim = x0
-                    while lx_lim > max(0, x0 - max_expand) and abs(int(gray[cy, lx_lim - 1]) - center_val) <= 25:
+                    while lx_lim > max(0, x0 - max_expand) and int(np.abs(cleaned_bgr[cy, lx_lim - 1].astype(np.int16) - center_bgr).sum()) <= 45:
                         lx_lim -= 1
                     rx_lim = x1
-                    while rx_lim < min(pil_img.width, x1 + max_expand) and abs(int(gray[cy, rx_lim]) - center_val) <= 25:
+                    while rx_lim < min(pil_img.width, x1 + max_expand) and int(np.abs(cleaned_bgr[cy, rx_lim].astype(np.int16) - center_bgr).sum()) <= 45:
                         rx_lim += 1
                     if (rx_lim - lx_lim) > bw + 2 * margin_pad:
                         x0, x1 = lx_lim + margin_pad, rx_lim - margin_pad
                         bw = max(20, x1 - x0)
 
             if tall_vertical or angled:
+                if pil_img.mode != "RGBA":
+                    pil_img = pil_img.convert("RGBA")
+                    draw = ImageDraw.Draw(pil_img)
                 render_angle = 90.0 if tall_vertical else blk.angle_deg
                 fit_w, fit_h = (bh, bw) if tall_vertical else (bw, bh)
                 diag = int(math.hypot(bw, bh)) + 20
@@ -431,14 +474,15 @@ class MangaRenderer:
                     lx = x0 + max(0, (bw - lw) // 2)
                     kwargs = {
                         "font": font,
-                        "fill": (*fill_rgb, 255),
+                        "fill": fill_rgb if pil_img.mode == "RGB" else (*fill_rgb, 255),
                         "stroke_width": stroke_w,
                     }
                     if stroke_w:
-                        kwargs["stroke_fill"] = (*stroke_rgb, 255)
+                        kwargs["stroke_fill"] = stroke_rgb if pil_img.mode == "RGB" else (*stroke_rgb, 255)
                     if is_rtl and _HAS_RAQM:
                         kwargs["direction"] = "rtl"
                     draw.text((lx, cur_y), disp, **kwargs)
                     cur_y += line_h
 
-        return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+        out_rgb = pil_img.convert("RGB") if pil_img.mode != "RGB" else pil_img
+        return cv2.cvtColor(np.array(out_rgb), cv2.COLOR_RGB2BGR)
