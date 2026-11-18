@@ -4,14 +4,45 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import platform
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-import cv2
+ROOT = Path(__file__).resolve().parent
+VENV_DIR = ROOT / ".venv"
 
-from app.pipeline import MangaTranslationPipeline
+
+def _bootstrap_venv() -> None:
+    if os.getenv("KOMAWEAVE_NO_VENV_REEXEC") == "1":
+        return
+    vpy = VENV_DIR / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
+    in_local_venv = Path(sys.prefix).resolve() == VENV_DIR.resolve()
+    if not in_local_venv and vpy.exists():
+        raise SystemExit(subprocess.call([str(vpy), str(Path(__file__).resolve()), *sys.argv[1:]]))
+    try:
+        import cv2  # noqa: F401
+        import rapidocr  # noqa: F401
+        import torch  # noqa: F401
+        return
+    except ImportError:
+        if not in_local_venv:
+            subprocess.check_call([sys.executable, str(ROOT / "setup_project.py"), "--venv"])
+            if vpy.exists():
+                raise SystemExit(subprocess.call([str(vpy), str(Path(__file__).resolve()), *sys.argv[1:]]))
+        else:
+            subprocess.check_call([sys.executable, str(ROOT / "setup_project.py")])
+
+
+_bootstrap_venv()
+
+import cv2  # noqa: E402
+
+from app.pipeline import MangaTranslationPipeline  # noqa: E402
 
 
 async def translate_chapter(

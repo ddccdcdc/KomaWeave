@@ -112,14 +112,47 @@ class GeneralOCREngine:
         return self._fast_det_engine
 
     @staticmethod
-    def _build_det_engine(use_cuda: bool, fast_mode: bool = False) -> RapidOCR:
-        return RapidOCR(
+    def _ensure_det_td(eng: RapidOCR):
+        if eng.text_det is None:
+            loader = getattr(eng, "_load_det_model", None)
+            if callable(loader):
+                loader()
+            if eng.text_det is None:
+                from rapidocr.ch_ppocr_det import TextDetector
+
+                cfg = eng.cfg
+                cfg.Det.engine_cfg = cfg.EngineConfig[cfg.Det.engine_type.value]
+                cfg.Det.model_root_dir = cfg.Global.model_root_dir
+                eng.text_det = TextDetector(cfg.Det)
+        return eng.text_det
+
+    @staticmethod
+    def _ensure_rec_tr(eng: RapidOCR):
+        if eng.text_rec is None:
+            loader = getattr(eng, "_load_rec_model", None)
+            if callable(loader):
+                loader()
+            if eng.text_rec is None:
+                from rapidocr.ch_ppocr_rec import TextRecognizer
+
+                cfg = eng.cfg
+                cfg.Rec.engine_cfg = cfg.EngineConfig[cfg.Rec.engine_type.value]
+                cfg.Rec.font_path = cfg.Global.font_path
+                cfg.Rec.model_root_dir = cfg.Global.model_root_dir
+                eng.text_rec = TextRecognizer(cfg.Rec)
+        return eng.text_rec
+
+    @classmethod
+    def _build_det_engine(cls, use_cuda: bool, fast_mode: bool = False) -> RapidOCR:
+        eng = RapidOCR(
             params={
                 "EngineConfig.onnxruntime.use_cuda": use_cuda,
                 "EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search": "HEURISTIC",
                 "EngineConfig.onnxruntime.cuda_ep_cfg.arena_extend_strategy": "kSameAsRequested",
                 "EngineConfig.onnxruntime.cuda_ep_cfg.gpu_mem_limit": 3 * 1024 * 1024 * 1024,
+                "Global.use_det": True,
                 "Global.use_cls": False,
+                "Global.use_rec": fast_mode,
                 "Det.model_type": ModelType.TINY if fast_mode else ModelType.MEDIUM,
                 "Rec.model_type": ModelType.TINY if fast_mode else ModelType.SMALL,
                 "Det.limit_type": "max",
@@ -129,17 +162,25 @@ class GeneralOCREngine:
                 "Det.unclip_ratio": OCR_DET_UNCLIP_RATIO,
             }
         )
+        cls._ensure_det_td(eng)
+        if fast_mode:
+            cls._ensure_rec_tr(eng)
+        return eng
 
-    @staticmethod
-    def _build_rec_engine(fast_mode: bool = False) -> RapidOCR:
-        return RapidOCR(
+    @classmethod
+    def _build_rec_engine(cls, fast_mode: bool = False) -> RapidOCR:
+        eng = RapidOCR(
             params={
                 "EngineConfig.onnxruntime.use_cuda": False,
+                "Global.use_det": False,
                 "Global.use_cls": False,
+                "Global.use_rec": True,
                 "Det.model_type": ModelType.TINY,
                 "Rec.model_type": ModelType.TINY if fast_mode else ModelType.SMALL,
             }
         )
+        cls._ensure_rec_tr(eng)
+        return eng
 
     def ensure_fast_pool(self, workers: int = 4, fast_mode: bool = True) -> List[RapidOCR]:
         """Lazily initialize a thread-safe pool of CPU Rec workers for batch OCR."""
@@ -201,7 +242,8 @@ class GeneralOCREngine:
 
         crops = [c[1] for c in candidates]
         rec_engine = engine or self.rec_engine
-        rec_res = rec_engine.text_rec(TextRecInput(img=crops))
+        rec_tr = self._ensure_rec_tr(rec_engine)
+        rec_res = rec_tr(TextRecInput(img=crops))
         if not rec_res or not rec_res.txts:
             return
 
@@ -426,7 +468,8 @@ class GeneralOCREngine:
         else:
             det_eng = self.det_engine
             rec_eng = self.rec_engine
-        det_td = det_eng.text_det
+        det_td = self._ensure_det_td(det_eng)
+        rec_tr = self._ensure_rec_tr(rec_eng)
         target_side = 800 if (self._fast_det_engine is not None and det_eng is self._fast_det_engine) else 1280
         prep = self._prep_padded(det_td, image_bgr, target_side)
         if prep is None:
@@ -439,7 +482,7 @@ class GeneralOCREngine:
         boxes = det_td.sorted_boxes(boxes)
 
         crops = [self._crop_poly(image_bgr, np.asarray(b, dtype=np.float32)) for b in boxes]
-        rec_res = rec_eng.text_rec(TextRecInput(img=crops))
+        rec_res = rec_tr(TextRecInput(img=crops))
         if not rec_res or not rec_res.txts:
             return [], []
 
@@ -574,7 +617,7 @@ class GeneralOCREngine:
         use_tiny = (ocr_model == "tiny")
         det_eng = self.fast_det_engine if use_tiny else self.det_engine
         target_side = 800 if use_tiny else 1280
-        det_td = det_eng.text_det
+        det_td = self._ensure_det_td(det_eng)
         rec_pool = self.ensure_fast_pool(workers=min(4, max(2, workers)), fast_mode=use_tiny)
 
         # 1. Parallel CPU preprocess + pad to fixed square tensor so CUDA never re-tunes shapes
@@ -628,7 +671,8 @@ class GeneralOCREngine:
 
             def _run_rec(item: Tuple[int, int, List[np.ndarray]]):
                 w_idx, offset, crops_sub = item
-                res = rec_pool[w_idx % len(rec_pool)].text_rec(TextRecInput(img=crops_sub))
+                rec_tr = self._ensure_rec_tr(rec_pool[w_idx % len(rec_pool)])
+                res = rec_tr(TextRecInput(img=crops_sub))
                 return offset, res
 
             with ThreadPoolExecutor(max_workers=len(rec_pool)) as ex:

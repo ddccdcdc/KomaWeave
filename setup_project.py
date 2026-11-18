@@ -1,19 +1,23 @@
-"""Single-command reproducible setup for the Manga & Manhwa Translation System."""
+"""Single-command reproducible setup for KomaWeave."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 FONTS_DIR = ROOT / "fonts"
 VENV_DIR = ROOT / ".venv"
+
+VC_REDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 
 FONT_URLS = {
     "MangaLatin-Bold.ttf": "https://github.com/google/fonts/raw/main/ofl/comicneue/ComicNeue-Bold.ttf",
@@ -24,21 +28,65 @@ FONT_URLS = {
 }
 
 
+def _venv_python() -> Path:
+    if platform.system() == "Windows":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
 def _in_virtualenv() -> bool:
-    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    return Path(sys.prefix).resolve() == VENV_DIR.resolve() or (
+        sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    )
 
 
 def _ensure_venv_and_reexec() -> None:
     if _in_virtualenv():
         return
-    print(f"[0/4] Creating virtual environment at {VENV_DIR} ...")
-    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-    if platform.system() == "Windows":
-        vpy = VENV_DIR / "Scripts" / "python.exe"
+    vpy = _venv_python()
+    if not vpy.exists():
+        print(f"[0/4] Creating virtual environment at {VENV_DIR} ...")
+        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
     else:
-        vpy = VENV_DIR / "bin" / "python"
+        print(f"[0/4] Using existing virtual environment at {VENV_DIR} ...")
     args = [str(vpy), str(Path(__file__).resolve()), *[a for a in sys.argv[1:] if a != "--venv"]]
     raise SystemExit(subprocess.call(args))
+
+
+def _ensure_windows_vc_redist() -> None:
+    """Ensure Microsoft VC++ 2015-2022 Redistributable DLLs exist on Windows."""
+    if platform.system() != "Windows":
+        return
+    missing = False
+    for dll in ("vcruntime140_1.dll", "msvcp140.dll"):
+        try:
+            ctypes.WinDLL(dll)
+        except OSError:
+            missing = True
+            break
+    if not missing:
+        return
+    print("[0/4] Installing missing Microsoft Visual C++ Redistributable (x64)...")
+    installer = Path(tempfile.gettempdir()) / "vc_redist.x64.exe"
+    try:
+        req = urllib.request.Request(VC_REDIST_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            installer.write_bytes(resp.read())
+        res = subprocess.run(
+            [str(installer), "/install", "/quiet", "/norestart"],
+            check=False,
+        )
+        # 0 = success, 3010 = reboot required (DLLs are already usable), 1638 = newer version already present
+        if res.returncode not in {0, 1638, 3010}:
+            print(f"  [Warning] vc_redist installer exited with code {res.returncode}")
+    except Exception as exc:
+        print(f"  [Warning] Could not auto-install VC++ Redistributable: {exc}")
+    finally:
+        try:
+            if installer.exists():
+                installer.unlink()
+        except OSError:
+            pass
 
 
 def _detect_accelerator(requested: str) -> str:
@@ -77,7 +125,6 @@ def install_dependencies(accel: str) -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
 
     if accel == "cuda":
-        # Check if CUDA-enabled torch is already installed
         has_cuda_torch = False
         try:
             import torch  # type: ignore
@@ -114,11 +161,25 @@ def download_fonts() -> None:
 def precache_models() -> None:
     print("[4/4] Pre-caching OCR (PP-OCRv6) & inpainting (mayocream/aot-inpainting) models...")
     sys.path.insert(0, str(ROOT))
+    import cv2
+    import numpy as np
+
     from app.inpainter import SmartInpainter
     from app.ocr_engine import GeneralOCREngine
 
+    dummy = np.full((320, 320, 3), 255, dtype=np.uint8)
+    cv2.putText(dummy, "TEST", (40, 170), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4)
+
     ocr = GeneralOCREngine()
+    ocr.extract(dummy)
+    ocr.extract_batch([dummy, dummy])
+
     inp = SmartInpainter()
+    inp.remove_text(
+        dummy,
+        [np.array([[30, 110], [260, 110], [260, 190], [30, 190]], dtype=np.float32)],
+        inpaint_mode="aot_only",
+    )
     print(
         f"Setup complete! (OCR CUDA={ocr.use_cuda}, Inpainter device={inp.device})\n"
         "Start the server with: python run.py"
@@ -126,7 +187,7 @@ def precache_models() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="One-command setup for Manga & Manhwa Translator.")
+    parser = argparse.ArgumentParser(description="One-command setup for KomaWeave.")
     parser.add_argument(
         "--device",
         choices=["auto", "cuda", "mps", "cpu"],
@@ -144,6 +205,8 @@ def main() -> None:
         help="Skip pre-downloading OCR and inpainting weights.",
     )
     args = parser.parse_args()
+
+    _ensure_windows_vc_redist()
 
     if args.venv:
         _ensure_venv_and_reexec()
